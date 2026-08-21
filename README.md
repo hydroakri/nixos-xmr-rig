@@ -47,7 +47,14 @@ and injects it into a local `config.json` (also gitignored, generated from
   permission checks generally, not just for the MSR device); it's scoped
   to this one binary via file capabilities, but worth knowing if you're
   auditing this for a hardened setup.
-- Starts XMRig under `gamemoderun` (CPU governor → performance)
+- Registers itself with `gamemoded` directly over D-Bus before `exec`-ing
+  into xmrig (CPU governor → performance, I/O priority boost). Not done via
+  the usual `gamemoderun` LD_PRELOAD wrapper — `ld.so` ignores
+  `LD_PRELOAD`/`LD_LIBRARY_PATH` for any binary carrying file capabilities,
+  so that hook never fires on a capability-carrying xmrig. `exec` doesn't
+  change the calling shell's PID, so registering that PID with gamemode
+  first and then `exec`-ing into xmrig lands xmrig registered under the
+  same PID — no LD_PRELOAD needed.
 
 Sudo/doas is only invoked when something actually needs to change — huge
 pages and the capability grant both persist until reboot (or until the

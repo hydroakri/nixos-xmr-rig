@@ -114,5 +114,22 @@ else
     echo "⚠️  setcap failed, continuing without (hashrate will be slightly lower)" >&2
 fi
 
-echo "🎮 Starting XMRig under gamemoderun (CPU governor -> performance, I/O/process priority boost)"
-exec gamemoderun "$XMRIG_BIN" -c config.json
+# `gamemoderun`'s usual trick is LD_PRELOAD-ing a constructor that
+# self-registers with gamemoded — but ld.so ignores LD_PRELOAD/LD_LIBRARY_PATH
+# for any binary carrying file capabilities (same class of protection as the
+# nosuid mount stripping capabilities above, just enforced by the dynamic
+# linker instead of the kernel), so it silently never fires on $XMRIG_BIN.
+# Sidestep it: `exec` replaces this shell's process image without changing
+# its PID, so registering *this shell's own* PID with gamemoded now, then
+# exec-ing into xmrig, leaves xmrig running under the exact PID gamemode
+# already tracks — same effect, no LD_PRELOAD involved. gamemoded's reaper
+# thread auto-unregisters it a few seconds after the process exits.
+echo "🎮 Registering with gamemoded via D-Bus (CPU governor -> performance, I/O priority boost)"
+if busctl --user call com.feralinteractive.GameMode /com/feralinteractive/GameMode com.feralinteractive.GameMode RegisterGame i "$$" >/dev/null 2>&1; then
+    echo "   ✅ registered PID $$ with gamemoded"
+else
+    echo "⚠️  gamemode registration failed, continuing without" >&2
+fi
+
+echo "🚀 Starting XMRig"
+exec "$XMRIG_BIN" -c config.json
