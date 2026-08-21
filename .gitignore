@@ -1,0 +1,9 @@
+# Your real Monero payout address — never commit this. mine.sh injects
+# the real value into the local config.json (also gitignored) at launch.
+wallet-address.local
+
+# Generated locally by mine.sh from config.json.example (which has a
+# YOUR_WALLET_ADDRESS_HERE placeholder + gets the pool IP rewritten on
+# every run). Never commit — this is the file that carries the real
+# wallet address once mine.sh has run.
+config.json
