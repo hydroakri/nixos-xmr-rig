@@ -28,11 +28,11 @@ generated from `config.json.example` on first run.
 - Injects the wallet address from `wallet-address.local` into `config.json`
 - Resolves the pool IP via Quad9 unfiltered DoH (`9.9.9.10`), writes it
   into `config.json`
-- Picks a thread count from current load average (physical cores minus
-  ceil(load1), floor of 1) and pins it to one logical CPU per physical
-  core — never naive sequential 0..N-1, which would start doubling up on
-  SMT sibling pairs past the physical core count; RandomX doesn't benefit
-  from those and xmrig's own default avoids them too
+- Uses every physical core by default (override with `MINE_THREADS` in
+  `mining-profile.local` to cap it) and pins threads to one logical CPU
+  per physical core — never naive sequential 0..N-1, which would start
+  doubling up on SMT sibling pairs past the physical core count; RandomX
+  doesn't benefit from those and xmrig's own default avoids them too
 - Picks RandomX fast/light mode from available RAM (< 3072MB → light), then
   sizes and reserves huge pages to match the mode and actual thread count —
   not a flat constant, so it doesn't over- or under-reserve on a host
@@ -57,48 +57,32 @@ generated from `config.json.example` on first run.
   (network, refreshed every 5 min, falling back to local Tor SOCKS on
   `127.0.0.1:9050` if present and direct access is blocked). Piped/non-TTY
   runs get a single one-line pending/paid print instead of the bar.
-- Runs a control loop for the life of the process (owns xmrig's PID,
-  restarts included) that rechecks load average every 15s and renices
-  xmrig between a baseline and 19 in response (hysteresis: raises at
-  other-load>0.5, only lowers back at <0.1, so it doesn't flip-flop when
-  load hovers near the line) — this is what keeps deferring to other work
-  if the box gets busier hours into a session (e.g. a router's traffic
-  spiking). The baseline comes from `MINE_CPU_PRIORITY` if set (0→nice 19,
-  5→nice 0) — a floor for how eager xmrig gets to be *when nothing's
-  contending*, not a way to opt out of deferring when something actually
-  is.
-- If the thread count came from auto-detection (not an explicit
-  `MINE_THREADS`) and load stays low enough to fit more threads for 20
-  straight minutes, the same loop restarts xmrig with a recomputed
-  (higher) thread count — the launch-time pick only reacts to load *then*,
-  this is what lets it recover back up once a lull passes rather than
-  staying capped for the rest of the session. Huge pages are provisioned
-  for all physical cores up front specifically so this restart never needs
-  a bigger reservation — and therefore never needs a sudo prompt — mid
-  session. Doesn't apply when `MINE_THREADS` is explicit: that's a
-  deliberate cap (e.g. a router you never want fully loaded), not a
-  starting guess to grow back from.
-- The same loop caps `scaling_max_freq` on every core by 10% of the
-  hardware's range whenever CPU temp is >= 85°C, and releases it back by
-  the same step once temp drops under 75°C — a hardware-safety response,
-  not a throughput one, so unlike thread count it applies even with an
-  explicit `MINE_THREADS`. Doesn't touch xmrig at all (no restart, no
-  RandomX dataset re-init) — just clocks down whatever's currently
-  running. A no-op wherever the cpufreq ACL grant above wasn't possible.
+- Runs a control loop for the life of the process that caps
+  `scaling_max_freq` on every core by 10% of the hardware's range whenever
+  CPU temp is >= 85°C, and releases it back by the same step once temp
+  drops under 75°C — a hardware-safety response, not a throughput one, so
+  it applies regardless of thread count. Doesn't touch xmrig at all (no
+  restart, no RandomX dataset re-init) — just clocks down whatever's
+  currently running. A no-op wherever the cpufreq grant above wasn't
+  possible.
 
 Sudo is only invoked when state actually needs to change. Huge pages and
 the capability grant persist until reboot.
 
+Full power by default: every physical core, no OS-level deference to
+other processes on the box. The only thing that ever holds it back is the
+85°C/75°C thermal cap above — hardware safety, not a courtesy setting.
+
 ## Running on a shared/constrained host
 
-Both memory (RandomX mode/huge pages) and CPU contention (thread count,
-ongoing renice) are already auto-detected — no config needed for most
-cases, including a router/SBC also running other important workloads.
-`mining-profile.local` (gitignored) exists for when you want to override
-the auto-detection instead of trusting it:
+Memory sizing (RandomX mode/huge pages) is auto-detected from available
+RAM. Thread count is not — it always defaults to every physical core.
+On a host where something else needs the CPU (a router, an SBC running
+other workloads), cap it explicitly via `mining-profile.local`
+(gitignored):
 
 ```sh
-MINE_THREADS=1          # cap CPU threads (default: unset = auto from load average)
+MINE_THREADS=1          # cap CPU threads (default: unset = every physical core)
 MINE_RANDOMX_MODE=light # force fast/light (default: unset = auto from available RAM)
 MINE_HUGEPAGES=0         # override the huge-pages page count, 0 disables it (default: unset = auto)
 MINE_CPU_PRIORITY=1      # xmrig's own 0-5 internal thread priority (default: unset)
