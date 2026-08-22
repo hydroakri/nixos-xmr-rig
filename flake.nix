@@ -9,7 +9,7 @@
       pkgs = import nixpkgs { inherit system; };
     in {
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ pkgs.xmrig ];
+        packages = [ pkgs.xmrig pkgs.lm_sensors ];
       };
     };
 }

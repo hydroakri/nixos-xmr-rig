@@ -6,8 +6,39 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-echo "🔍 Resolving xmrig binary path (nix develop)"
-XMRIG_STORE_BIN="$(nix develop --command bash -c 'readlink -f "$(which xmrig)"')"
+# On a real TTY, reserve the terminal's last row as a status bar right now,
+# before anything is printed. DECSTBM (the scroll-region escape below) resets
+# the cursor to the region's top-left as a side effect — doing this before
+# any output means nothing is on screen yet to get overwritten by that
+# reset. Everything printed from here on (these setup lines included) flows
+# continuously within the confined region; only row N stays reserved.
+IS_TTY=false
+if [[ -t 1 ]]; then
+    IS_TTY=true
+    LINES_TOTAL=$(tput lines)
+    # Clear first: DECSTBM below jumps the cursor to the screen's absolute
+    # top-left regardless of where it was, so without a clear, whatever was
+    # already on screen above the old cursor position gets overwritten.
+    printf '\033[2J\033[H'
+    printf '\033[1;%dr' "$((LINES_TOTAL - 1))"
+
+    draw_status() {
+        printf '\0337'
+        printf '\033[%d;1H\033[K' "$LINES_TOTAL"
+        printf '%s' "$1"
+        printf '\0338'
+    }
+
+    cleanup_bar() {
+        [[ -n "${STATUS_LOOP_PID:-}" ]] && kill "$STATUS_LOOP_PID" 2>/dev/null
+        printf '\033[r'
+        printf '\033[%d;1H\n' "$LINES_TOTAL"
+    }
+    trap cleanup_bar EXIT INT TERM
+fi
+
+echo "🔍 Resolving xmrig + sensors binary paths (nix develop)"
+read -r XMRIG_STORE_BIN SENSORS_BIN < <(nix develop --command bash -c 'echo "$(readlink -f "$(which xmrig)") $(readlink -f "$(which sensors)")"')
 if [[ -z "$XMRIG_STORE_BIN" ]]; then
     echo "❌ Failed to resolve xmrig path" >&2
     exit 1
@@ -83,6 +114,21 @@ else
     echo "⚠️  Quad9 unfiltered DoH lookup failed, keeping the IP already in config.json" >&2
 fi
 
+# Force-enabled every run so configs generated before this existed also
+# pick it up. Loopback-only + restricted:true — GET /1/summary works with
+# no access-token, only write actions would need one. Scoped to just the
+# "http" block (awk state machine, not a blind sed) — "enabled" and "port"
+# both appear elsewhere in this file (cpu/opencl/cuda/pools[].enabled) and
+# a global replace would wrongly flip those too.
+XMRIG_API_PORT=18099
+awk -v port="$XMRIG_API_PORT" '
+/"http": *\{/ { in_http=1 }
+in_http && /"enabled":/ { sub(/false/, "true") }
+in_http && /"port":/ { sub(/[0-9]+/, port) }
+in_http && /^[[:space:]]*\},?[[:space:]]*$/ { in_http=0 }
+{ print }
+' config.json > config.json.tmp && mv config.json.tmp config.json
+
 echo "⚡ Checking huge pages + MSR tuning (RandomX perf boost, safe to skip)"
 # Only touch privileged state that isn't already in the desired shape —
 # this is what makes repeat "start mining" runs need zero sudo prompts
@@ -114,29 +160,32 @@ else
     echo "⚠️  setcap failed, continuing without (hashrate will be slightly lower)" >&2
 fi
 
-echo "📊 Cumulative progress"
 # Direct first; if that's blocked, retry via local Tor SOCKS only if
 # already present on this machine (no hard Tor dependency — a machine
-# without it just gets the warning below).
-POOL_STATS=""
-if [[ -n "${WALLET_ADDRESS:-}" ]]; then
-    POOL_STATS="$(curl -sL --max-time 6 "https://supportxmr.com/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
-    if [[ -z "$POOL_STATS" ]] && timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9050' 2>/dev/null; then
-        echo "   direct fetch blocked, local Tor SOCKS found — retrying through it"
-        POOL_STATS="$(curl -sL --socks5-hostname 127.0.0.1:9050 --max-time 30 "https://supportxmr.com/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
+# without it just gets the warning). Echoes the pool's raw JSON, empty on
+# total failure. Shared by the live status bar loop below and the
+# non-interactive one-shot fallback.
+fetch_pool_stats_json() {
+    local stats=""
+    if [[ -n "${WALLET_ADDRESS:-}" ]]; then
+        stats="$(curl -sL --max-time 6 "https://supportxmr.com/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
+        if [[ -z "$stats" ]] && timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9050' 2>/dev/null; then
+            stats="$(curl -sL --socks5-hostname 127.0.0.1:9050 --max-time 30 "https://supportxmr.com/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
+        fi
     fi
-fi
+    echo "$stats" | grep -q '"amtDue"' && echo "$stats"
+}
 
-if echo "$POOL_STATS" | grep -q '"amtDue"'; then
-    AMT_DUE=$(echo "$POOL_STATS" | grep -o '"amtDue":[0-9]*' | grep -o '[0-9]*')
-    AMT_PAID=$(echo "$POOL_STATS" | grep -o '"amtPaid":[0-9]*' | grep -o '[0-9]*')
-    VALID_SHARES=$(echo "$POOL_STATS" | grep -o '"validShares":[0-9]*' | grep -o '[0-9]*')
-    awk -v due="${AMT_DUE:-0}" -v paid="${AMT_PAID:-0}" -v shares="${VALID_SHARES:-0}" 'BEGIN {
-        printf "   XMR Pending: %.12f\n   XMR Paid:    %.12f\n   Valid shares: %s\n", due/1e12, paid/1e12, shares
-    }'
-else
-    echo "   ⚠️  couldn't reach the pool's API (direct blocked, no local Tor) — see README" >&2
-fi
+# Local, cheap, safe to poll every few seconds — xmrig's own loopback API
+# and the sensors binary resolved earlier.
+fetch_hashrate() {
+    curl -s --max-time 2 "http://127.0.0.1:${XMRIG_API_PORT}/1/summary" 2>/dev/null \
+        | grep -o '"total":\[[0-9.,null]*\]' | grep -oE '[0-9]+\.[0-9]+' | head -1
+}
+
+fetch_cpu_temp() {
+    "$SENSORS_BIN" 2>/dev/null | grep -m1 -oE 'Tctl:[[:space:]]*\+?[0-9.]+' | grep -oE '[0-9.]+$'
+}
 
 echo "🚀 Starting XMRig"
 # Backgrounded (not exec'd) so we can capture xmrig's actual PID for the
@@ -157,6 +206,74 @@ if busctl --user call com.feralinteractive.GameMode /com/feralinteractive/GameMo
     echo "   ✅ registered PID $XMRIG_PID with gamemoded"
 else
     echo "⚠️  gamemode registration failed, continuing without" >&2
+fi
+
+if [[ "$IS_TTY" == true ]]; then
+    (
+        # Hashrate + temp are local and cheap — refreshed every tick (10s).
+        # Pool data needs a network round-trip and shouldn't be hammered —
+        # refreshed every 30th tick (~5 min). ETA to the 0.1 XMR payout
+        # threshold comes from the delta between consecutive pool readings,
+        # no extra requests needed for it.
+        POOL_PART="fetching pool data..."
+        PREV_DUE=""
+        PREV_TIME=""
+        TICK=0
+        while true; do
+            HASHRATE="$(fetch_hashrate)"
+            TEMP="$(fetch_cpu_temp)"
+
+            if (( TICK % 30 == 0 )); then
+                STATS_JSON="$(fetch_pool_stats_json)"
+                if [[ -n "$STATS_JSON" ]]; then
+                    DUE=$(echo "$STATS_JSON" | grep -o '"amtDue":[0-9]*' | grep -o '[0-9]*')
+                    PAID=$(echo "$STATS_JSON" | grep -o '"amtPaid":[0-9]*' | grep -o '[0-9]*')
+                    SHARES=$(echo "$STATS_JSON" | grep -o '"validShares":[0-9]*' | grep -o '[0-9]*')
+                    NOW=$(date +%s)
+                    ETA_TEXT="calculating..."
+                    if [[ -n "$PREV_DUE" && "$DUE" -gt "$PREV_DUE" ]]; then
+                        ETA_TEXT="$(awk -v due="$DUE" -v prev="$PREV_DUE" -v now="$NOW" -v prevt="$PREV_TIME" 'BEGIN {
+                            rate = (due - prev) / (now - prevt)
+                            target = 100000000000
+                            remain = target - due
+                            if (rate <= 0 || remain <= 0) { print "n/a"; exit }
+                            secs = remain / rate
+                            d = int(secs / 86400); secs -= d * 86400
+                            h = int(secs / 3600); secs -= h * 3600
+                            m = int(secs / 60)
+                            if (d > 0) printf "%dd %dh", d, h
+                            else if (h > 0) printf "%dh %dm", h, m
+                            else printf "%dm", m
+                        }')"
+                    fi
+                    PREV_DUE="$DUE"
+                    PREV_TIME="$NOW"
+                    POOL_PART="$(awk -v due="${DUE:-0}" -v paid="${PAID:-0}" -v shares="${SHARES:-0}" -v eta="$ETA_TEXT" 'BEGIN {
+                        printf "Pending: %.8f | Paid: %.8f | Shares: %s | ETA: %s", due/1e12, paid/1e12, shares, eta
+                    }')"
+                else
+                    POOL_PART="⚠️  pool unreachable (direct blocked, no local Tor)"
+                fi
+            fi
+            TICK=$((TICK + 1))
+
+            draw_status "🌡️ ${TEMP:-N/A}°C | ⚡ ${HASHRATE:-N/A} H/s | ${POOL_PART}"
+            sleep 10
+        done
+    ) &
+    STATUS_LOOP_PID=$!
+else
+    STATS_JSON="$(fetch_pool_stats_json)"
+    if [[ -n "$STATS_JSON" ]]; then
+        DUE=$(echo "$STATS_JSON" | grep -o '"amtDue":[0-9]*' | grep -o '[0-9]*')
+        PAID=$(echo "$STATS_JSON" | grep -o '"amtPaid":[0-9]*' | grep -o '[0-9]*')
+        SHARES=$(echo "$STATS_JSON" | grep -o '"validShares":[0-9]*' | grep -o '[0-9]*')
+        awk -v due="${DUE:-0}" -v paid="${PAID:-0}" -v shares="${SHARES:-0}" 'BEGIN {
+            printf "📊 XMR Pending: %.8f | XMR Paid: %.8f | Valid shares: %s\n", due/1e12, paid/1e12, shares
+        }'
+    else
+        echo "⚠️  couldn't reach the pool's API (direct blocked, no local Tor)" >&2
+    fi
 fi
 
 wait "$XMRIG_PID"

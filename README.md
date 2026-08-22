@@ -30,12 +30,17 @@ generated from `config.json.example` on first run.
 - Reserves huge pages (1280 × 2MB) for the RandomX dataset + thread
   scratchpads
 - Grants `cap_sys_rawio` + `cap_dac_override` on the xmrig binary (MSR mod)
-- Prints cumulative progress (XMR pending/paid from the pool API — direct,
-  falling back to local Tor SOCKS on `127.0.0.1:9050` if present); prints a
-  warning instead if neither reaches the pool
+- Force-enables xmrig's loopback HTTP API (port 18099, restricted) for the
+  live hashrate reading below
 - Registers the process with `gamemoded` over D-Bus (CPU governor →
   performance, I/O priority)
 - Runs `xmrig -c config.json`
+- On a real terminal, reserves the last row as a live status bar via ANSI
+  scroll-region control codes — no tmux dependency: CPU temp + hashrate
+  (local, refreshed every 10s) and pool pending/paid/shares/ETA-to-payout
+  (network, refreshed every 5 min, falling back to local Tor SOCKS on
+  `127.0.0.1:9050` if present and direct access is blocked). Piped/non-TTY
+  runs get a single one-line pending/paid print instead of the bar.
 
 Sudo is only invoked when state actually needs to change. Huge pages and
 the capability grant persist until reboot.
