@@ -30,6 +30,9 @@ generated from `config.json.example` on first run.
 - Reserves huge pages (1280 × 2MB) for the RandomX dataset + thread
   scratchpads
 - Grants `cap_sys_rawio` + `cap_dac_override` on the xmrig binary (MSR mod)
+- Prints cumulative progress (XMR pending/paid from the pool API — direct,
+  falling back to local Tor SOCKS on `127.0.0.1:9050` if present); prints a
+  warning instead if neither reaches the pool
 - Registers the process with `gamemoded` over D-Bus (CPU governor →
   performance, I/O priority)
 - Runs `xmrig -c config.json`

@@ -114,22 +114,49 @@ else
     echo "⚠️  setcap failed, continuing without (hashrate will be slightly lower)" >&2
 fi
 
+echo "📊 Cumulative progress"
+# Direct first; if that's blocked, retry via local Tor SOCKS only if
+# already present on this machine (no hard Tor dependency — a machine
+# without it just gets the warning below).
+POOL_STATS=""
+if [[ -n "${WALLET_ADDRESS:-}" ]]; then
+    POOL_STATS="$(curl -sL --max-time 6 "https://supportxmr.com/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
+    if [[ -z "$POOL_STATS" ]] && timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9050' 2>/dev/null; then
+        echo "   direct fetch blocked, local Tor SOCKS found — retrying through it"
+        POOL_STATS="$(curl -sL --socks5-hostname 127.0.0.1:9050 --max-time 30 "https://supportxmr.com/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
+    fi
+fi
+
+if echo "$POOL_STATS" | grep -q '"amtDue"'; then
+    AMT_DUE=$(echo "$POOL_STATS" | grep -o '"amtDue":[0-9]*' | grep -o '[0-9]*')
+    AMT_PAID=$(echo "$POOL_STATS" | grep -o '"amtPaid":[0-9]*' | grep -o '[0-9]*')
+    VALID_SHARES=$(echo "$POOL_STATS" | grep -o '"validShares":[0-9]*' | grep -o '[0-9]*')
+    awk -v due="${AMT_DUE:-0}" -v paid="${AMT_PAID:-0}" -v shares="${VALID_SHARES:-0}" 'BEGIN {
+        printf "   XMR Pending: %.12f\n   XMR Paid:    %.12f\n   Valid shares: %s\n", due/1e12, paid/1e12, shares
+    }'
+else
+    echo "   ⚠️  couldn't reach the pool's API (direct blocked, no local Tor) — see README" >&2
+fi
+
+echo "🚀 Starting XMRig"
+# Backgrounded (not exec'd) so we can capture xmrig's actual PID for the
+# gamemode registration below.
+"$XMRIG_BIN" -c config.json &
+XMRIG_PID=$!
+
 # `gamemoderun`'s usual trick is LD_PRELOAD-ing a constructor that
 # self-registers with gamemoded — but ld.so ignores LD_PRELOAD/LD_LIBRARY_PATH
 # for any binary carrying file capabilities (same class of protection as the
 # nosuid mount stripping capabilities above, just enforced by the dynamic
 # linker instead of the kernel), so it silently never fires on $XMRIG_BIN.
-# Sidestep it: `exec` replaces this shell's process image without changing
-# its PID, so registering *this shell's own* PID with gamemoded now, then
-# exec-ing into xmrig, leaves xmrig running under the exact PID gamemode
-# already tracks — same effect, no LD_PRELOAD involved. gamemoded's reaper
-# thread auto-unregisters it a few seconds after the process exits.
+# Register xmrig's actual PID (captured above) directly over D-Bus instead —
+# same effect, no LD_PRELOAD involved. gamemoded's reaper thread
+# auto-unregisters it a few seconds after the process exits.
 echo "🎮 Registering with gamemoded via D-Bus (CPU governor -> performance, I/O priority boost)"
-if busctl --user call com.feralinteractive.GameMode /com/feralinteractive/GameMode com.feralinteractive.GameMode RegisterGame i "$$" >/dev/null 2>&1; then
-    echo "   ✅ registered PID $$ with gamemoded"
+if busctl --user call com.feralinteractive.GameMode /com/feralinteractive/GameMode com.feralinteractive.GameMode RegisterGame i "$XMRIG_PID" >/dev/null 2>&1; then
+    echo "   ✅ registered PID $XMRIG_PID with gamemoded"
 else
     echo "⚠️  gamemode registration failed, continuing without" >&2
 fi
 
-echo "🚀 Starting XMRig"
-exec "$XMRIG_BIN" -c config.json
+wait "$XMRIG_PID"
