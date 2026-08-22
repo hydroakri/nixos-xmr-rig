@@ -112,6 +112,7 @@ if [[ -f "$WALLET_ADDRESS_FILE" ]]; then
     WALLET_ADDRESS="$(tr -d '[:space:]' < "$WALLET_ADDRESS_FILE")"
     sed -i -E "s/\"user\": *\"[^\"]*\"/\"user\": \"${WALLET_ADDRESS}\"/" config.json
     echo "   ✅ wallet address injected"
+    echo "   📊 dashboard: https://www.supportxmr.com/#/dashboard?wallet=${WALLET_ADDRESS}"
 else
     echo "❌ $WALLET_ADDRESS_FILE not found — put your Monero address in it (one line, nothing else)" >&2
     exit 1
@@ -200,10 +201,12 @@ MINE_THREADS=""
 MINE_RANDOMX_MODE=""
 MINE_HUGEPAGES=""
 MINE_CPU_PRIORITY=""
+MINE_TEMP_TARGET=""
+MINE_TEMP_DEADBAND=""
 if [[ -f mining-profile.local ]]; then
     # shellcheck disable=SC1091
     source mining-profile.local
-    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-all}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default})"
+    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-all}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default}, temp-target=${MINE_TEMP_TARGET:-80}°C±${MINE_TEMP_DEADBAND:-2})"
 fi
 
 # Always every physical core unless a profile explicitly caps it — no
@@ -464,9 +467,9 @@ launch_xmrig() {
     # governor's step is decoupled from the error size, which is what
     # produces that oscillation (repeated ΔT swings, worse for thermal-
     # cycling fatigue than settling at one point).
-    T_TARGET=80        # midpoint of the old 85°C cap / 75°C release band
-    TEMP_DEADBAND=2    # +/-2°C dead zone around target, absorbs sensor
-                        # read noise instead of chasing every +/-0.5°C jitter
+    T_TARGET="${MINE_TEMP_TARGET:-80}"       # default: midpoint of the old 85°C cap / 75°C release band
+    TEMP_DEADBAND="${MINE_TEMP_DEADBAND:-2}" # default +/-2°C dead zone around target, absorbs sensor
+                                              # read noise instead of chasing every +/-0.5°C jitter
     # Max per-tick swing, same magnitude as the old fixed step (10% of the
     # hardware's freq range) — the proportional response is clamped to
     # this, so one bad reading can't slam frequency to an extreme in one

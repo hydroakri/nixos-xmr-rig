@@ -91,7 +91,16 @@ MINE_THREADS=1          # cap CPU threads (default: unset = every physical core)
 MINE_RANDOMX_MODE=light # force fast/light (default: unset = auto from available RAM)
 MINE_HUGEPAGES=0         # override the huge-pages page count, 0 disables it (default: unset = auto)
 MINE_CPU_PRIORITY=1      # xmrig's own 0-5 internal thread priority (default: unset)
+MINE_TEMP_TARGET=70      # thermal governor's target °C (default: unset = 80)
+MINE_TEMP_DEADBAND=3     # +/-°C dead zone around the target (default: unset = 2)
 ```
+
+`MINE_TEMP_TARGET`/`MINE_TEMP_DEADBAND` matter most on hosts with weak or
+passive cooling (e.g. a Raspberry Pi) that never comfortably reach the
+80°C default — lowering the target makes the governor start capping
+clock speed earlier and settle at a lower steady-state frequency, trading
+some throughput for staying further from the hardware's real thermal
+limit.
 
 ## Notes
 
