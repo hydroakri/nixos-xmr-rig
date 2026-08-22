@@ -48,6 +48,16 @@ generated from `config.json.example` on first run.
   regardless of what a prior session left it at
 - Force-enables xmrig's loopback HTTP API (port 18099, restricted) for the
   live hashrate reading below
+- Grants this user write access on `cpufreq scaling_governor` for every
+  core, same reasoning and mechanism as `scaling_max_freq` above — a
+  self-started gamemoded (next bullet) needs it, since unlike a
+  system-installed one it carries no capability wrapper and its governor
+  switch is a plain file write
+- Starts its own `gamemoded` if the session D-Bus doesn't already have one
+  registered (e.g. a bare SSH-only host with no desktop session or system
+  gamemode install) — left running after this script exits so later runs
+  find it already there. A no-op wherever one's already running (e.g. a
+  desktop's own system-wide install)
 - Registers the process with `gamemoded` over D-Bus (CPU governor →
   performance, I/O priority)
 - Runs `xmrig -c config.json`

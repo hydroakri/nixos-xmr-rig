@@ -12,7 +12,7 @@
         let pkgs = import nixpkgs { inherit system; };
         in {
           default = pkgs.mkShell {
-            packages = [ pkgs.xmrig ];
+            packages = [ pkgs.xmrig pkgs.gamemode ];
           };
         }
       );

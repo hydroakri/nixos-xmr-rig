@@ -46,6 +46,32 @@ if [[ -z "$XMRIG_STORE_BIN" ]]; then
 fi
 echo "   $XMRIG_STORE_BIN"
 
+echo "🔍 Resolving gamemoded binary path (nix develop)"
+GAMEMODED_STORE_BIN="$(nix develop --command bash -c 'readlink -f "$(which gamemoded)" 2>/dev/null')"
+
+# Starts our own gamemoded if the session bus doesn't already have one
+# claimed. A desktop machine may already run one system-wide (this
+# project's own copy is then a no-op, skipped below) — a bare SSH-only
+# host has neither the package nor a running daemon, so this is what
+# actually makes launch_xmrig's RegisterGame call below succeed there.
+# Left running after this script exits (cheap, idle when nothing's
+# registered) so the next run finds it already reachable instead of
+# paying this startup cost again.
+if busctl --user list --acquired 2>/dev/null | grep -q com.feralinteractive.GameMode; then
+    echo "   ✅ gamemoded already reachable on the session bus, skipping"
+elif [[ -n "$GAMEMODED_STORE_BIN" ]]; then
+    "$GAMEMODED_STORE_BIN" >/dev/null 2>&1 &
+    disown
+    sleep 0.3
+    if busctl --user list --acquired 2>/dev/null | grep -q com.feralinteractive.GameMode; then
+        echo "   ✅ started project-local gamemoded"
+    else
+        echo "⚠️  started gamemoded but it never claimed the D-Bus name, continuing without" >&2
+    fi
+else
+    echo "⚠️  couldn't resolve gamemoded binary, continuing without" >&2
+fi
+
 # sudo on this box is a doas shim and doesn't support `sudo -v` credential
 # probing/caching, so each privileged command is called individually. If
 # this script is already running as root (e.g. launched via sudo/doas),
@@ -352,6 +378,25 @@ fi
 CPUFREQ_HW_MAX="$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)"
 CPUFREQ_HW_MIN="$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq 2>/dev/null || echo 0)"
 
+# Same grant, for scaling_governor this time — gamemoded's "governor ->
+# performance" switch is just a plain file write, no special Linux
+# capability involved, so this alone is what lets a self-started,
+# unprivileged gamemoded (see above, the case a bare SSH-only host without
+# a NixOS-wrapped system gamemoded needs) actually change it instead of
+# silently failing the write internally. A no-op where a system gamemoded
+# already runs with its own capability wrapper (e.g. NixOS's
+# programs.gamemode module) — this only matters for our self-started copy.
+CPUFREQ_GOVERNOR_FILES=(/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor)
+if [[ -e "${CPUFREQ_GOVERNOR_FILES[0]}" ]]; then
+    if [[ -w "${CPUFREQ_GOVERNOR_FILES[0]}" ]]; then
+        echo "   ✅ cpufreq scaling_governor already writable, skipping"
+    elif "${PRIV[@]}" chmod a+w "${CPUFREQ_GOVERNOR_FILES[@]}" 2>/dev/null; then
+        echo "   ✅ granted write access to cpufreq scaling_governor (gamemode)"
+    else
+        echo "⚠️  couldn't grant scaling_governor access, gamemode's governor switch will be a no-op" >&2
+    fi
+fi
+
 # Writes $1 (kHz) to every core's scaling_max_freq — this, not thread-count
 # reduction, is the thermal governor's actual lever: it caps clock speed
 # under all currently-running threads instead of stopping some of them, so
@@ -429,11 +474,8 @@ fetch_cpu_temp() {
     [[ -n "$hottest" ]] && awk -v m="$hottest" 'BEGIN { printf "%.1f", m/1000 }'
 }
 
-# Launches (or relaunches) xmrig from config.json + the current
-# $MINE_THREADS, capturing its PID into the global $XMRIG_PID, registering
-# it with gamemoded, and setting its baseline niceness. Called once below,
-# and again from the control loop further down when it recovers a higher
-# thread count later in the session.
+# Launches xmrig from config.json + $MINE_THREADS, capturing its PID into
+# the global $XMRIG_PID and registering it with gamemoded.
 launch_xmrig() {
     echo "🚀 Starting XMRig (threads=${MINE_THREADS})"
     # Backgrounded (not exec'd) so we can capture xmrig's actual PID.
@@ -448,10 +490,11 @@ launch_xmrig() {
     # it silently never fires on $XMRIG_BIN. Register directly over D-Bus
     # instead — same effect, no LD_PRELOAD involved. gamemoded's reaper
     # thread auto-unregisters it a few seconds after the process exits.
-    if busctl --user call com.feralinteractive.GameMode /com/feralinteractive/GameMode com.feralinteractive.GameMode RegisterGame i "$XMRIG_PID" >/dev/null 2>&1; then
+    GAMEMODE_ERR="$(busctl --user call com.feralinteractive.GameMode /com/feralinteractive/GameMode com.feralinteractive.GameMode RegisterGame i "$XMRIG_PID" 2>&1 >/dev/null)"
+    if [[ $? -eq 0 ]]; then
         echo "   ✅ registered PID $XMRIG_PID with gamemoded"
     else
-        echo "⚠️  gamemode registration failed, continuing without" >&2
+        echo "⚠️  gamemode registration failed, continuing without: ${GAMEMODE_ERR}" >&2
     fi
 }
 
