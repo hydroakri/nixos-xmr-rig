@@ -57,10 +57,15 @@ generated from `config.json.example` on first run.
   (network, refreshed every 5 min, falling back to local Tor SOCKS on
   `127.0.0.1:9050` if present and direct access is blocked). Piped/non-TTY
   runs get a single one-line pending/paid print instead of the bar.
-- Runs a control loop for the life of the process that caps
-  `scaling_max_freq` on every core by 10% of the hardware's range whenever
-  CPU temp is >= 85°C, and releases it back by the same step once temp
-  drops under 75°C — a hardware-safety response, not a throughput one, so
+- Runs a control loop for the life of the process that adjusts
+  `scaling_max_freq` on every core every 15s using proportional control
+  (step size scales with the temperature error, not a fixed-threshold
+  trigger) targeting 80°C ±2°C — converges to a stable frequency in 1-2
+  ticks under sustained load instead of oscillating off a hard cap
+  threshold and back. Capping (too hot) is twice as sensitive as releasing
+  (cooler than target): overshooting down only costs a little throughput,
+  overshooting up risks tripping the hardware's own PROCHOT before the
+  next tick catches it. Hardware safety, not a throughput optimization, so
   it applies regardless of thread count. Doesn't touch xmrig at all (no
   restart, no RandomX dataset re-init) — just clocks down whatever's
   currently running. A no-op wherever the cpufreq grant above wasn't
@@ -71,7 +76,7 @@ the capability grant persist until reboot.
 
 Full power by default: every physical core, no OS-level deference to
 other processes on the box. The only thing that ever holds it back is the
-85°C/75°C thermal cap above — hardware safety, not a courtesy setting.
+thermal governor above — hardware safety, not a courtesy setting.
 
 ## Running on a shared/constrained host
 

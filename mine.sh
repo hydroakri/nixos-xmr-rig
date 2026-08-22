@@ -416,12 +416,28 @@ launch_xmrig() {
 (
     launch_xmrig
 
-    TEMP_HIGH=85
-    TEMP_OK=75
-    # Cools by 10% of the hardware's freq range per tick sustained hot,
-    # warms back by the same step sustained cool — small enough not to
-    # overshoot and oscillate, big enough to matter within a few ticks.
-    FREQ_STEP=$(( (CPUFREQ_HW_MAX - CPUFREQ_HW_MIN) / 10 ))
+    # Proportional control, not fixed-threshold bang-bang: step size scales
+    # with how far off T_TARGET the reading is, so the loop converges to a
+    # stable frequency in 1-2 ticks under sustained load instead of
+    # endlessly bouncing off a cap threshold and back — a fixed-threshold
+    # governor's step is decoupled from the error size, which is what
+    # produces that oscillation (repeated ΔT swings, worse for thermal-
+    # cycling fatigue than settling at one point).
+    T_TARGET=80        # midpoint of the old 85°C cap / 75°C release band
+    TEMP_DEADBAND=2    # +/-2°C dead zone around target, absorbs sensor
+                        # read noise instead of chasing every +/-0.5°C jitter
+    # Max per-tick swing, same magnitude as the old fixed step (10% of the
+    # hardware's freq range) — the proportional response is clamped to
+    # this, so one bad reading can't slam frequency to an extreme in one
+    # tick.
+    FREQ_STEP_MAX=$(( (CPUFREQ_HW_MAX - CPUFREQ_HW_MIN) / 10 ))
+    # Asymmetric gain: capping (too hot) reaches full step at 5°C past the
+    # deadband, releasing (cooler than target) only at 10°C past it — twice
+    # as sensitive capping down as releasing up. Overshooting on the down
+    # side only costs a little throughput; overshooting up risks tripping
+    # the hardware's own PROCHOT before this loop's next 15s tick catches it.
+    KP_DOWN=$(( FREQ_STEP_MAX / 5 ))
+    KP_UP=$(( FREQ_STEP_MAX / 10 ))
     CURRENT_MAX_FREQ="$CPUFREQ_HW_MAX"
     # Optimistic until proven otherwise — self-disables the first time an
     # actual write fails, rather than retrying (and re-logging) every 15s
@@ -438,23 +454,29 @@ launch_xmrig() {
         # thing here that isn't full-power-by-default. A no-op wherever
         # CPUFREQ_HW_MAX is 0 (no accessible cpufreq knob on this host).
         if [[ -n "$TEMP" && "$CPUFREQ_HW_MAX" -gt 0 && "$CPUFREQ_WRITABLE" == true ]]; then
-            if awk -v t="$TEMP" -v hi="$TEMP_HIGH" 'BEGIN { exit !(t >= hi) }'; then
-                NEW_MAX_FREQ=$((CURRENT_MAX_FREQ - FREQ_STEP))
-                [[ "$NEW_MAX_FREQ" -lt "$CPUFREQ_HW_MIN" ]] && NEW_MAX_FREQ="$CPUFREQ_HW_MIN"
-                if [[ "$NEW_MAX_FREQ" -ne "$CURRENT_MAX_FREQ" ]]; then
-                    if set_cpu_max_freq "$NEW_MAX_FREQ"; then
-                        echo "   🌡️  ${TEMP}°C >= ${TEMP_HIGH}°C, capping max freq $((CURRENT_MAX_FREQ / 1000))MHz -> $((NEW_MAX_FREQ / 1000))MHz"
-                        CURRENT_MAX_FREQ="$NEW_MAX_FREQ"
-                    else
-                        echo "⚠️  cpufreq write failed (permission?), disabling thermal governor for this session" >&2
-                        CPUFREQ_WRITABLE=false
-                    fi
-                fi
-            elif awk -v t="$TEMP" -v ok="$TEMP_OK" 'BEGIN { exit !(t < ok) }' && [[ "$CURRENT_MAX_FREQ" -lt "$CPUFREQ_HW_MAX" ]]; then
-                NEW_MAX_FREQ=$((CURRENT_MAX_FREQ + FREQ_STEP))
-                [[ "$NEW_MAX_FREQ" -gt "$CPUFREQ_HW_MAX" ]] && NEW_MAX_FREQ="$CPUFREQ_HW_MAX"
+            NEW_MAX_FREQ="$(awk -v t="$TEMP" -v target="$T_TARGET" -v db="$TEMP_DEADBAND" \
+                -v kd="$KP_DOWN" -v ku="$KP_UP" -v cur="$CURRENT_MAX_FREQ" \
+                -v hwmax="$CPUFREQ_HW_MAX" -v hwmin="$CPUFREQ_HW_MIN" -v maxstep="$FREQ_STEP_MAX" 'BEGIN {
+                err = t - target
+                if (err > db) {
+                    delta = -kd * (err - db)
+                } else if (err < -db) {
+                    delta = ku * (-err - db)
+                } else {
+                    delta = 0
+                }
+                if (delta > maxstep) delta = maxstep
+                if (delta < -maxstep) delta = -maxstep
+                nf = cur + delta
+                if (nf > hwmax) nf = hwmax
+                if (nf < hwmin) nf = hwmin
+                printf "%d", nf
+            }')"
+            if [[ "$NEW_MAX_FREQ" -ne "$CURRENT_MAX_FREQ" ]]; then
                 if set_cpu_max_freq "$NEW_MAX_FREQ"; then
-                    echo "   🌡️  ${TEMP}°C < ${TEMP_OK}°C, releasing max freq $((CURRENT_MAX_FREQ / 1000))MHz -> $((NEW_MAX_FREQ / 1000))MHz"
+                    DIRECTION="capping"
+                    [[ "$NEW_MAX_FREQ" -gt "$CURRENT_MAX_FREQ" ]] && DIRECTION="releasing"
+                    echo "   🌡️  ${TEMP}°C (target ${T_TARGET}°C ±${TEMP_DEADBAND}), ${DIRECTION} max freq $((CURRENT_MAX_FREQ / 1000))MHz -> $((NEW_MAX_FREQ / 1000))MHz"
                     CURRENT_MAX_FREQ="$NEW_MAX_FREQ"
                 else
                     echo "⚠️  cpufreq write failed (permission?), disabling thermal governor for this session" >&2
