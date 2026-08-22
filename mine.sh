@@ -118,22 +118,40 @@ else
 fi
 sed -i -E "s/\"rig-id\": *\"[^\"]*\"/\"rig-id\": \"$(hostname)\"/" config.json
 
-echo "🌐 Resolving pool IP via Quad9 unfiltered DoH (bypasses local sing-box blocklist + Quad9's own default-node filtering)"
 # sing-box's hijack-dns intercepts every plain DNS query (port 53 / DNS
 # protocol) system-wide, so even querying 8.8.8.8/1.1.1.1 directly gets
 # answered locally. DoH (HTTPS/443) isn't sniffed as DNS traffic, and the
 # query is inside TLS, so sing-box can't see which domain we're asking
 # about. Use 9.9.9.10 (Quad9's unfiltered node — the default 9.9.9.9 node
-# blocks this domain too via its own threat-intel feed).
+# blocks these domains too via its own threat-intel feed). Echoes the
+# first A record, empty on failure. Shared by both domains below — the
+# stratum pool and the separate stats-API domain hit the same blocklist
+# chain for the same reason.
+resolve_via_doh() {
+    dig +https +short A "$1" @9.9.9.10 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1
+}
+
+echo "🌐 Resolving pool IP via Quad9 unfiltered DoH (bypasses local sing-box blocklist + Quad9's own default-node filtering)"
 POOL_DOMAIN="pool.supportxmr.com"
 POOL_PORT="443"
-RESOLVED_IP="$(dig +https +short A "$POOL_DOMAIN" @9.9.9.10 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+RESOLVED_IP="$(resolve_via_doh "$POOL_DOMAIN")"
 if [[ -n "$RESOLVED_IP" ]]; then
     sed -i -E "s/\"url\": *\"[^\"]*:${POOL_PORT}\"/\"url\": \"${RESOLVED_IP}:${POOL_PORT}\"/" config.json
     echo "   ✅ pool IP refreshed to ${RESOLVED_IP} (${POOL_DOMAIN})"
 else
     echo "⚠️  Quad9 unfiltered DoH lookup failed, keeping the IP already in config.json" >&2
 fi
+
+# The status bar's pending/paid stats come from supportxmr.com's own web
+# API — a different domain than the stratum pool above, blocked by the
+# same blocklist chain, but never routed around because that fetch
+# (further down) still went through system DNS. Resolve it here too and
+# hand the IP to curl via --resolve, which overrides only the DNS step —
+# TLS SNI and cert validation still happen against the real hostname, so
+# unlike the pool url hack above there's no need to disable SNI (xmrig's
+# config has no equivalent to --resolve; curl does).
+STATS_DOMAIN="supportxmr.com"
+STATS_DOMAIN_IP="$(resolve_via_doh "$STATS_DOMAIN")"
 
 # Force-enabled every run so configs generated before this existed also
 # pick it up. Loopback-only + restricted:true — GET /1/summary works with
@@ -334,17 +352,20 @@ if [[ -w "${CPUFREQ_MAX_FILES[0]:-/nonexistent}" && "$CPUFREQ_HW_MAX" -gt 0 ]]; 
     set_cpu_max_freq "$CPUFREQ_HW_MAX"
 fi
 
-# Direct first; if that's blocked, retry via local Tor SOCKS only if
+# Direct first (via the DoH-resolved IP above, same blocklist bypass as
+# the pool url); if that's blocked, retry via local Tor SOCKS only if
 # already present on this machine (no hard Tor dependency — a machine
-# without it just gets the warning). Echoes the pool's raw JSON, empty on
-# total failure. Shared by the live status bar loop below and the
-# non-interactive one-shot fallback.
+# without it just gets the warning). Tor gets no --resolve: its own exit
+# node does DNS, already unaffected by any local blocking. Echoes the
+# pool's raw JSON, empty on total failure. Shared by the live status bar
+# loop below and the non-interactive one-shot fallback.
 fetch_pool_stats_json() {
-    local stats=""
+    local stats="" resolve_arg=()
+    [[ -n "$STATS_DOMAIN_IP" ]] && resolve_arg=(--resolve "${STATS_DOMAIN}:443:${STATS_DOMAIN_IP}")
     if [[ -n "${WALLET_ADDRESS:-}" ]]; then
-        stats="$(curl -sL --max-time 6 "https://supportxmr.com/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
+        stats="$(curl -sL "${resolve_arg[@]}" --max-time 6 "https://${STATS_DOMAIN}/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
         if [[ -z "$stats" ]] && timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9050' 2>/dev/null; then
-            stats="$(curl -sL --socks5-hostname 127.0.0.1:9050 --max-time 30 "https://supportxmr.com/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
+            stats="$(curl -sL --socks5-hostname 127.0.0.1:9050 --max-time 30 "https://${STATS_DOMAIN}/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
         fi
     fi
     echo "$stats" | grep -q '"amtDue"' && echo "$stats"
