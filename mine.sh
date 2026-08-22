@@ -253,14 +253,26 @@ else
     CURRENT_HUGEPAGES="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
     if [[ "$CURRENT_HUGEPAGES" -ge "$MINE_HUGEPAGES" && "$CURRENT_HUGEPAGES" -lt $((MINE_HUGEPAGES * 2)) ]]; then
         echo "   ✅ huge pages already at ${CURRENT_HUGEPAGES} (fits ${MINE_HUGEPAGES} needed), skipping"
-    elif "${PRIV[@]}" sysctl -w "vm.nr_hugepages=${MINE_HUGEPAGES}"; then
-        if [[ "$CURRENT_HUGEPAGES" -gt "$MINE_HUGEPAGES" ]]; then
-            echo "   ✅ huge pages reclaimed from ${CURRENT_HUGEPAGES} down to ${MINE_HUGEPAGES}"
-        else
-            echo "   ✅ huge pages set to ${MINE_HUGEPAGES}"
-        fi
     else
-        echo "⚠️  failed to set huge pages, continuing without" >&2
+        # On a long-running/memory-tight box, free RAM can be fragmented
+        # enough that the kernel can't actually find $MINE_HUGEPAGES
+        # contiguous 2MB blocks — compact_memory defragments first, giving
+        # the reservation below a real shot at the full count instead of
+        # silently granting fewer (sysctl -w itself still exits 0 either
+        # way, so this alone wouldn't have caught a shortfall).
+        "${PRIV[@]}" sh -c 'echo 1 > /proc/sys/vm/compact_memory' 2>/dev/null
+        if "${PRIV[@]}" sysctl -w "vm.nr_hugepages=${MINE_HUGEPAGES}" >/dev/null; then
+            ACTUAL_HUGEPAGES="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
+            if [[ "$ACTUAL_HUGEPAGES" -lt "$MINE_HUGEPAGES" ]]; then
+                echo "⚠️  requested ${MINE_HUGEPAGES} huge pages but kernel only granted ${ACTUAL_HUGEPAGES} (RAM too fragmented for the rest) — xmrig will fall back to slower non-huge-page allocation for the shortfall; a reboot gives it a clean shot at the full amount" >&2
+            elif [[ "$CURRENT_HUGEPAGES" -gt "$MINE_HUGEPAGES" ]]; then
+                echo "   ✅ huge pages reclaimed from ${CURRENT_HUGEPAGES} down to ${ACTUAL_HUGEPAGES}"
+            else
+                echo "   ✅ huge pages set to ${ACTUAL_HUGEPAGES}"
+            fi
+        else
+            echo "⚠️  failed to set huge pages, continuing without" >&2
+        fi
     fi
 fi
 
