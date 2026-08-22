@@ -148,10 +148,19 @@ fi
 # (further down) still went through system DNS. Resolve it here too and
 # hand the IP to curl via --resolve, which overrides only the DNS step —
 # TLS SNI and cert validation still happen against the real hostname, so
-# unlike the pool url hack above there's no need to disable SNI (xmrig's
-# config has no equivalent to --resolve; curl does).
-STATS_DOMAIN="supportxmr.com"
+# this doesn't need xmrig's sni:false workaround (confirmed live: TLS
+# handshake completes fine once DNS is out of the way, so SNI inspection
+# isn't in play here). Use www.supportxmr.com directly rather than the
+# bare domain — the bare domain 301-redirects to www, and curl -sL (used
+# below) would follow that to a *second* hostname our --resolve override
+# doesn't cover, right back to a blocked system-DNS lookup.
+STATS_DOMAIN="www.supportxmr.com"
 STATS_DOMAIN_IP="$(resolve_via_doh "$STATS_DOMAIN")"
+if [[ -n "$STATS_DOMAIN_IP" ]]; then
+    echo "   ✅ stats API IP resolved to ${STATS_DOMAIN_IP} (${STATS_DOMAIN})"
+else
+    echo "⚠️  Quad9 unfiltered DoH lookup for stats API failed, status bar pending/paid may be unavailable" >&2
+fi
 
 # Force-enabled every run so configs generated before this existed also
 # pick it up. Loopback-only + restricted:true — GET /1/summary works with
