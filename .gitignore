@@ -7,3 +7,7 @@ wallet-address.local
 # every run). Never commit — this is the file that carries the real
 # wallet address once mine.sh has run.
 config.json
+
+# Optional per-host tuning (threads/randomx-mode/huge-pages/cpu-priority).
+# Host-specific by design — not committed.
+mining-profile.local

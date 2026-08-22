@@ -31,14 +31,15 @@ if [[ -t 1 ]]; then
 
     cleanup_bar() {
         [[ -n "${STATUS_LOOP_PID:-}" ]] && kill "$STATUS_LOOP_PID" 2>/dev/null
+        [[ -n "${CONTROL_LOOP_PID:-}" ]] && kill "$CONTROL_LOOP_PID" 2>/dev/null
         printf '\033[r'
         printf '\033[%d;1H\n' "$LINES_TOTAL"
     }
     trap cleanup_bar EXIT INT TERM
 fi
 
-echo "🔍 Resolving xmrig + sensors binary paths (nix develop)"
-read -r XMRIG_STORE_BIN SENSORS_BIN < <(nix develop --command bash -c 'echo "$(readlink -f "$(which xmrig)") $(readlink -f "$(which sensors)")"')
+echo "🔍 Resolving xmrig binary path (nix develop)"
+XMRIG_STORE_BIN="$(nix develop --command bash -c 'readlink -f "$(which xmrig)"')"
 if [[ -z "$XMRIG_STORE_BIN" ]]; then
     echo "❌ Failed to resolve xmrig path" >&2
     exit 1
@@ -54,6 +55,25 @@ if [[ "$(id -u)" -eq 0 ]]; then
 else
     PRIV=(sudo)
 fi
+
+# One representative logical CPU per physical core (lowest-numbered of each
+# thread_siblings_list group) — RandomX doesn't benefit from SMT/hyperthreads
+# (two logical threads sharing one core's L2 fight over cache), so any
+# thread-count array we build should stay within this list, not a naive
+# sequential 0..N-1 that would start doubling up on SMT sibling pairs past
+# the physical core count. Portable across x86/ARM; falls back to plain
+# `nproc` (best-effort, may include SMT siblings) if the topology files
+# aren't there.
+PHYSICAL_CORE_LIST="$(
+    for f in /sys/devices/system/cpu/cpu*/topology/thread_siblings_list; do
+        cpu="$(echo "$f" | grep -oE 'cpu[0-9]+' | grep -oE '[0-9]+')"
+        echo "$(cat "$f" 2>/dev/null) $cpu"
+    done 2>/dev/null | sort -t' ' -k1,1V -k2,2n | awk '!seen[$1]++ {print $2}' | sort -n | paste -sd, -
+)"
+if [[ -z "$PHYSICAL_CORE_LIST" ]]; then
+    PHYSICAL_CORE_LIST="$(seq -s, 0 $(($(nproc) - 1)))"
+fi
+PHYSICAL_CORE_COUNT="$(echo "$PHYSICAL_CORE_LIST" | tr ',' '\n' | wc -l)"
 
 # /nix/store is read-only, so we can't setcap a file that lives there.
 # /home is mounted nosuid on this machine — the kernel silently strips file
@@ -96,6 +116,7 @@ else
     echo "❌ $WALLET_ADDRESS_FILE not found — put your Monero address in it (one line, nothing else)" >&2
     exit 1
 fi
+sed -i -E "s/\"rig-id\": *\"[^\"]*\"/\"rig-id\": \"$(hostname)\"/" config.json
 
 echo "🌐 Resolving pool IP via Quad9 unfiltered DoH (bypasses local sing-box blocklist + Quad9's own default-node filtering)"
 # sing-box's hijack-dns intercepts every plain DNS query (port 53 / DNS
@@ -129,22 +150,144 @@ in_http && /^[[:space:]]*\},?[[:space:]]*$/ { in_http=0 }
 { print }
 ' config.json > config.json.tmp && mv config.json.tmp config.json
 
+# Force-disabled every run too — xmrig's autosave would otherwise write
+# back per-host thread arrays on exit, and a config.json from before this
+# was set to false in config.json.example may still have it on. "autosave"
+# is a unique top-level key, safe for a plain sed (no block-scoping needed).
+sed -i -E 's/"autosave": *true/"autosave": false/' config.json
+
+# Optional local override for constrained/shared hosts (e.g. a router that
+# also happens to run this) — gitignored, like wallet-address.local. Absent
+# by default: full-power behavior, unchanged from before this existed.
+MINE_THREADS=""
+MINE_RANDOMX_MODE=""
+MINE_HUGEPAGES=""
+MINE_CPU_PRIORITY=""
+if [[ -f mining-profile.local ]]; then
+    # shellcheck disable=SC1091
+    source mining-profile.local
+    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-auto}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default})"
+fi
+
+# Decide a starting thread count from *current* load instead of always
+# grabbing every physical core — a snapshot at launch, not a guarantee (load
+# can rise later; the status bar loop below renices in response to that as
+# it happens). load1 already includes anything else running right now, so
+# reserving ceil(load1) cores back for it is a reasonable "don't make
+# existing contention worse" starting point. On a genuinely idle box this
+# reduces to ~all physical cores, same as before this existed.
+THREADS_WAS_AUTO=false
+if [[ -z "$MINE_THREADS" ]]; then
+    THREADS_WAS_AUTO=true
+    LOAD1="$(awk '{print $1}' /proc/loadavg)"
+    MINE_THREADS="$(awk -v ld="$LOAD1" -v cores="$PHYSICAL_CORE_COUNT" 'BEGIN {
+        busy = int(ld + 0.999)
+        free = cores - busy
+        if (free < 1) free = 1
+        if (free > cores) free = cores
+        print free
+    }')"
+    echo "   🔍 auto-detected threads: ${MINE_THREADS} (load ${LOAD1}, ${PHYSICAL_CORE_COUNT} physical cores)"
+fi
+
+# Decide fast vs light ourselves (from available RAM) instead of leaving
+# randomx.mode at xmrig's own "auto" — we're not confident enough in
+# exactly how conservative that internal heuristic is (never verified
+# against a real low-RAM host) to size huge pages against an unknown. This
+# also means the huge-pages math below is always sized for the mode that
+# actually gets used, never guessing.
+if [[ -z "$MINE_RANDOMX_MODE" ]]; then
+    MEM_AVAILABLE_MB="$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)"
+    if [[ -n "$MEM_AVAILABLE_MB" && "$MEM_AVAILABLE_MB" -lt 3072 ]]; then
+        MINE_RANDOMX_MODE="light"
+    else
+        MINE_RANDOMX_MODE="fast"
+    fi
+    echo "   🔍 auto-detected randomx-mode: ${MINE_RANDOMX_MODE} (${MEM_AVAILABLE_MB:-unknown}MB available, <3072MB picks light)"
+fi
+
+# Auto-size huge pages from thread count + the RandomX mode resolved above,
+# unless the profile set an explicit number (0 included, to disable).
+# RandomX's shared allocation is fixed regardless of thread count — fast
+# mode's dataset+JIT is 1168x 2MB pages (2336MB), light mode's cache is
+# 128x 2MB pages (256MB) — plus one 2MB scratchpad page per thread, which
+# does scale with thread count. When the thread count was auto-detected
+# (not pinned by a profile), size for *all* physical cores rather than just
+# the currently-picked count: the recovery loop below can raise the thread
+# count again later if load clears, and since it runs unattended it can't
+# prompt for the sudo a bigger reservation would need at that point. The
+# shared allocation dominates either way (2336MB vs. 2MB/thread), so
+# provisioning for the max costs next to nothing extra up front.
+if [[ -z "$MINE_HUGEPAGES" ]]; then
+    if [[ "$MINE_RANDOMX_MODE" == "light" ]]; then
+        BASE_PAGES=128
+    else
+        BASE_PAGES=1168
+    fi
+    if [[ "$THREADS_WAS_AUTO" == true ]]; then
+        MINE_HUGEPAGES=$((BASE_PAGES + PHYSICAL_CORE_COUNT + 32))
+    else
+        MINE_HUGEPAGES=$((BASE_PAGES + MINE_THREADS + 32))
+    fi
+fi
+
+# Rewrites config.json's thread pin from the *current* $MINE_THREADS —
+# called once below, and again from the recovery loop further down if it
+# restarts xmrig with a higher thread count later in the session. Uses
+# PHYSICAL_CORE_LIST (one logical CPU per physical core), never a naive
+# sequential 0..N-1 — past the physical core count, sequential numbering
+# starts doubling up on SMT sibling pairs, which is exactly what xmrig's
+# own default avoids and RandomX doesn't benefit from. randomx.mode and
+# cpu.priority are only ever set once (mode/priority don't change mid
+# session, only thread count does), so those two are no-ops on later calls.
+patch_thread_pin() {
+    local core_list threads_line
+    core_list="$(echo "$PHYSICAL_CORE_LIST" | cut -d, -f"1-${MINE_THREADS}")"
+    threads_line="        \"rx\": [${core_list}],"
+    awk -v threads_line="$threads_line" -v mode="$MINE_RANDOMX_MODE" -v prio="$MINE_CPU_PRIORITY" '
+    /"cpu": *\{/ { in_cpu=1 }
+    in_cpu && /"rx":/ { next }
+    in_cpu && /"enabled": *true,?/ && threads_line != "" { print; print threads_line; next }
+    in_cpu && /"priority":/ && prio != "" { sub(/null|[0-9]+/, prio) }
+    in_cpu && /^[[:space:]]*\},?[[:space:]]*$/ { in_cpu=0 }
+    /"randomx": *\{/ { in_rx=1 }
+    in_rx && /"mode":/ && mode != "" { sub(/"mode": *"[a-z]+"/, "\"mode\": \"" mode "\"") }
+    in_rx && /^[[:space:]]*\},?[[:space:]]*$/ { in_rx=0 }
+    { print }
+    ' config.json > config.json.tmp && mv config.json.tmp config.json
+}
+patch_thread_pin
+echo "   ✅ config.json set to randomx-mode=${MINE_RANDOMX_MODE}, threads=${MINE_THREADS}${MINE_CPU_PRIORITY:+, cpu-priority=$MINE_CPU_PRIORITY}"
+
 echo "⚡ Checking huge pages + MSR tuning (RandomX perf boost, safe to skip)"
 # Only touch privileged state that isn't already in the desired shape —
 # this is what makes repeat "start mining" runs need zero sudo prompts
 # (huge pages persist system-wide until reboot; the capability persists on
 # the binary until it's overwritten).
-
-# RandomX dataset needs 1168x 2MB pages (2336MB) + 8 more for the 8 mining
-# threads' scratchpads (2MB each) = 1176 minimum. 1280 leaves headroom.
-HUGEPAGES=1280
-CURRENT_HUGEPAGES="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
-if [[ "$CURRENT_HUGEPAGES" -ge "$HUGEPAGES" ]]; then
-    echo "   ✅ huge pages already at ${CURRENT_HUGEPAGES} (>= ${HUGEPAGES}), skipping"
-elif "${PRIV[@]}" sysctl -w "vm.nr_hugepages=${HUGEPAGES}"; then
-    echo "   ✅ huge pages set to ${HUGEPAGES}"
+if [[ "$MINE_HUGEPAGES" -eq 0 ]]; then
+    echo "   ⏭️  huge pages disabled via mining-profile.local, skipping"
+    sed -i -E 's/"huge-pages": *true/"huge-pages": false/' config.json
 else
-    echo "⚠️  failed to set huge pages, continuing without" >&2
+    # MINE_HUGEPAGES was auto-sized above from this host's actual thread
+    # count + RandomX mode (or came from an explicit profile override). Only
+    # touch the reservation if it's too small, or wastefully large (>2x
+    # what's needed now) — a prior session's fast-mode reservation left
+    # sitting there after this one auto-detects light mode, say. The 2x
+    # slack (not an exact match) is deliberate: small run-to-run swings in
+    # the auto-detected thread count shouldn't trigger a resize — and
+    # therefore a sudo prompt — on every single restart.
+    CURRENT_HUGEPAGES="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
+    if [[ "$CURRENT_HUGEPAGES" -ge "$MINE_HUGEPAGES" && "$CURRENT_HUGEPAGES" -lt $((MINE_HUGEPAGES * 2)) ]]; then
+        echo "   ✅ huge pages already at ${CURRENT_HUGEPAGES} (fits ${MINE_HUGEPAGES} needed), skipping"
+    elif "${PRIV[@]}" sysctl -w "vm.nr_hugepages=${MINE_HUGEPAGES}"; then
+        if [[ "$CURRENT_HUGEPAGES" -gt "$MINE_HUGEPAGES" ]]; then
+            echo "   ✅ huge pages reclaimed from ${CURRENT_HUGEPAGES} down to ${MINE_HUGEPAGES}"
+        else
+            echo "   ✅ huge pages set to ${MINE_HUGEPAGES}"
+        fi
+    else
+        echo "⚠️  failed to set huge pages, continuing without" >&2
+    fi
 fi
 
 # /dev/cpu/*/msr is mode 0600 root:root — cap_sys_rawio alone lets xmrig
@@ -158,6 +301,51 @@ elif "${PRIV[@]}" setcap cap_sys_rawio,cap_dac_override+ep "$XMRIG_BIN"; then
     echo "   ✅ granted MSR write capabilities (cap_sys_rawio + cap_dac_override)"
 else
     echo "⚠️  setcap failed, continuing without (hashrate will be slightly lower)" >&2
+fi
+
+# /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq is root:root 0644 —
+# chmod (not setfacl: sysfs doesn't actually persist POSIX ACLs, confirmed
+# by setfacl reporting success while the write still failed — chmod tested
+# and does work) grants this user write access one-time, like the
+# capability above, so the thermal governor further down can turn the
+# CPU's max clock up/down on its own later without needing a sudo prompt an
+# unattended background loop can't provide. Only some drivers expose this
+# knob (this box's amd-pstate-epp does); where it's missing, thermal
+# response just quietly has nothing to act on below.
+CPUFREQ_MAX_FILES=(/sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq)
+if [[ -e "${CPUFREQ_MAX_FILES[0]}" ]]; then
+    if [[ -w "${CPUFREQ_MAX_FILES[0]}" ]]; then
+        echo "   ✅ cpufreq scaling_max_freq already writable, skipping"
+    elif "${PRIV[@]}" chmod a+w "${CPUFREQ_MAX_FILES[@]}" 2>/dev/null; then
+        echo "   ✅ granted write access to cpufreq scaling_max_freq (thermal governor)"
+    else
+        echo "⚠️  couldn't grant cpufreq access, thermal response will be a no-op" >&2
+    fi
+fi
+CPUFREQ_HW_MAX="$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0)"
+CPUFREQ_HW_MIN="$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq 2>/dev/null || echo 0)"
+
+# Writes $1 (kHz) to every core's scaling_max_freq — this, not thread-count
+# reduction, is the thermal governor's actual lever: it caps clock speed
+# under all currently-running threads instead of stopping some of them, so
+# xmrig itself is never touched (no restart, no RandomX dataset re-init,
+# no gap in hashing) — just runs cooler and a bit slower until temperature
+# allows clocking back up.
+set_cpu_max_freq() {
+    local ok=true
+    for f in "${CPUFREQ_MAX_FILES[@]}"; do
+        echo "$1" > "$f" 2>/dev/null || ok=false
+    done
+    [[ "$ok" == true ]]
+}
+
+# Reset to full speed on every run regardless of what scaling_max_freq
+# happens to currently be — a prior session's thermal throttle, a manual
+# test, or anything else could have left it capped, and the control loop
+# below assumes it's starting from CPUFREQ_HW_MAX. Silent no-op if not
+# writable (already logged above) or the knob doesn't exist on this host.
+if [[ -w "${CPUFREQ_MAX_FILES[0]:-/nonexistent}" && "$CPUFREQ_HW_MAX" -gt 0 ]]; then
+    set_cpu_max_freq "$CPUFREQ_HW_MAX"
 fi
 
 # Direct first; if that's blocked, retry via local Tor SOCKS only if
@@ -176,37 +364,214 @@ fetch_pool_stats_json() {
     echo "$stats" | grep -q '"amtDue"' && echo "$stats"
 }
 
-# Local, cheap, safe to poll every few seconds — xmrig's own loopback API
-# and the sensors binary resolved earlier.
+# Shared by both the live status bar loop and the non-interactive fallback
+# below, instead of each re-deriving the same three fields independently.
+parse_pool_field() {
+    echo "$1" | grep -o "\"$2\":[0-9]*" | grep -o '[0-9]*'
+}
+
+# Local, cheap, safe to poll every few seconds — xmrig's own loopback API.
 fetch_hashrate() {
+    # xmrig's API JSON is pretty-printed with a space after the colon
+    # ("total": [...], not "total":[...]) — matched that literally, not
+    # against a synthetic guess, against a live instance's real output.
     curl -s --max-time 2 "http://127.0.0.1:${XMRIG_API_PORT}/1/summary" 2>/dev/null \
-        | grep -o '"total":\[[0-9.,null]*\]' | grep -oE '[0-9]+\.[0-9]+' | head -1
+        | grep -o '"total": *\[[0-9., null]*\]' | grep -oE '[0-9]+\.[0-9]+' | head -1
 }
 
 fetch_cpu_temp() {
-    "$SENSORS_BIN" 2>/dev/null | grep -m1 -oE 'Tctl:[[:space:]]*\+?[0-9.]+' | grep -oE '[0-9.]+$'
+    # /sys/class/thermal is the generic Linux thermal framework — works on
+    # x86 (ACPI) and ARM/RPi (SoC thermal zones) alike with zero extra
+    # dependencies, unlike lm_sensors' AMD-specific Tctl parsing. Zone
+    # numbering isn't guaranteed to mean the same thing across boards, so
+    # just take the hottest reading across all zones as a "how hot is this
+    # box running" proxy — good enough for a status bar.
+    local hottest=""
+    for f in /sys/class/thermal/thermal_zone*/temp; do
+        [[ -r "$f" ]] || continue
+        local milli
+        milli="$(cat "$f" 2>/dev/null)"
+        [[ "$milli" =~ ^[0-9]+$ ]] || continue
+        if [[ -z "$hottest" || "$milli" -gt "$hottest" ]]; then
+            hottest="$milli"
+        fi
+    done
+    [[ -n "$hottest" ]] && awk -v m="$hottest" 'BEGIN { printf "%.1f", m/1000 }'
 }
 
-echo "🚀 Starting XMRig"
-# Backgrounded (not exec'd) so we can capture xmrig's actual PID for the
-# gamemode registration below.
-"$XMRIG_BIN" -c config.json &
-XMRIG_PID=$!
+# Launches (or relaunches) xmrig from config.json + the current
+# $MINE_THREADS, capturing its PID into the global $XMRIG_PID, registering
+# it with gamemoded, and setting its baseline niceness. Called once below,
+# and again from the control loop further down when it recovers a higher
+# thread count later in the session.
+launch_xmrig() {
+    echo "🚀 Starting XMRig (threads=${MINE_THREADS})"
+    # Backgrounded (not exec'd) so we can capture xmrig's actual PID.
+    "$XMRIG_BIN" -c config.json &
+    XMRIG_PID=$!
 
-# `gamemoderun`'s usual trick is LD_PRELOAD-ing a constructor that
-# self-registers with gamemoded — but ld.so ignores LD_PRELOAD/LD_LIBRARY_PATH
-# for any binary carrying file capabilities (same class of protection as the
-# nosuid mount stripping capabilities above, just enforced by the dynamic
-# linker instead of the kernel), so it silently never fires on $XMRIG_BIN.
-# Register xmrig's actual PID (captured above) directly over D-Bus instead —
-# same effect, no LD_PRELOAD involved. gamemoded's reaper thread
-# auto-unregisters it a few seconds after the process exits.
-echo "🎮 Registering with gamemoded via D-Bus (CPU governor -> performance, I/O priority boost)"
-if busctl --user call com.feralinteractive.GameMode /com/feralinteractive/GameMode com.feralinteractive.GameMode RegisterGame i "$XMRIG_PID" >/dev/null 2>&1; then
-    echo "   ✅ registered PID $XMRIG_PID with gamemoded"
-else
-    echo "⚠️  gamemode registration failed, continuing without" >&2
+    # `gamemoderun`'s usual trick is LD_PRELOAD-ing a constructor that
+    # self-registers with gamemoded — but ld.so ignores
+    # LD_PRELOAD/LD_LIBRARY_PATH for any binary carrying file capabilities
+    # (same class of protection as the nosuid mount stripping capabilities
+    # above, just enforced by the dynamic linker instead of the kernel), so
+    # it silently never fires on $XMRIG_BIN. Register directly over D-Bus
+    # instead — same effect, no LD_PRELOAD involved. gamemoded's reaper
+    # thread auto-unregisters it a few seconds after the process exits.
+    if busctl --user call com.feralinteractive.GameMode /com/feralinteractive/GameMode com.feralinteractive.GameMode RegisterGame i "$XMRIG_PID" >/dev/null 2>&1; then
+        echo "   ✅ registered PID $XMRIG_PID with gamemoded"
+    else
+        echo "⚠️  gamemode registration failed, continuing without" >&2
+    fi
+
+    renice -n "$BASELINE_NICE" -p "$XMRIG_PID" >/dev/null 2>&1
+}
+
+# MINE_CPU_PRIORITY (xmrig's own internal 0-5 thread priority, if the
+# profile set one) becomes the *floor* niceness the control loop below
+# relaxes back to once contention clears — not a competing, uncoordinated
+# setting. A low MINE_CPU_PRIORITY means "be deferential even when nothing's
+# contending"; a high one means "fine to be normal-priority when idle-ish"
+# — but actual detected contention always still wins and pushes to nice 19
+# regardless, because the point of the loop is protecting *other* work on
+# the box, and that shouldn't be something a "run me aggressively"
+# preference can opt out of.
+BASELINE_NICE=0
+if [[ -n "$MINE_CPU_PRIORITY" ]]; then
+    BASELINE_NICE="$(awk -v p="$MINE_CPU_PRIORITY" 'BEGIN { n = 19 - (p * 19 / 5); if (n < 0) n = 0; if (n > 19) n = 19; printf "%d", n }')"
 fi
+
+# Single control loop, owns the xmrig process for the life of the script —
+# launches it *and* every subsequent restart, all as its own children. That
+# matters: `wait` can only block on a shell's own direct children, so if the
+# very first launch happened out here instead, this subshell could never
+# reliably `wait` for that instance to actually exit before starting a
+# replacement on a later recovery restart — risking two xmrig instances
+# briefly colliding over the same huge pages / HTTP port. One place owns
+# the whole lifecycle, first launch included, so `wait` always works.
+# Runs regardless of TTY.
+(
+    launch_xmrig
+
+    # Kills the running instance, points $MINE_THREADS at a new value,
+    # re-patches config.json, and relaunches. Only ever called to grow
+    # threads back (load-based recovery, further down) — thermal response
+    # doesn't touch thread count at all, see set_cpu_max_freq() above.
+    restart_with_threads() {
+        local new_threads="$1"
+        echo "   🔁 ${2}: threads ${MINE_THREADS} -> ${new_threads}"
+        local old_pid="$XMRIG_PID"
+        kill -TERM "$old_pid" 2>/dev/null
+        wait "$old_pid" 2>/dev/null
+        MINE_THREADS="$new_threads"
+        patch_thread_pin
+        launch_xmrig
+        CURRENT_NICE="$BASELINE_NICE"
+    }
+
+    CURRENT_NICE="$BASELINE_NICE"
+    LOW_LOAD_STREAK=0
+    # 80 ticks x 15s = 20 minutes of sustained low load before recovering
+    # more threads — a brief lull shouldn't trigger a restart (RandomX
+    # dataset re-init, a few seconds of no hashing) for a marginal gain.
+    RECOVERY_STREAK_TARGET=80
+    TEMP_HIGH=85
+    TEMP_OK=75
+    # Cools by 10% of the hardware's freq range per tick sustained hot,
+    # warms back by the same step sustained cool — small enough not to
+    # overshoot and oscillate, big enough to matter within a few ticks.
+    FREQ_STEP=$(( (CPUFREQ_HW_MAX - CPUFREQ_HW_MIN) / 10 ))
+    CURRENT_MAX_FREQ="$CPUFREQ_HW_MAX"
+    # Optimistic until proven otherwise — self-disables the first time an
+    # actual write fails, rather than retrying (and re-logging) every 15s
+    # for the rest of the session once we know it won't work.
+    CPUFREQ_WRITABLE=true
+    while kill -0 "$XMRIG_PID" 2>/dev/null; do
+        LOAD1="$(awk '{print $1}' /proc/loadavg)"
+        TEMP="$(fetch_cpu_temp)"
+
+        # Hysteresis, not a single cutoff: raise niceness once "other load"
+        # crosses 0.5, but only lower it back once that same figure drops
+        # under 0.1. A flat threshold would flip every 15s whenever load
+        # happens to hover near the line — load average isn't smooth, this
+        # is common, not an edge case.
+        TARGET_NICE="$(awk -v ld="$LOAD1" -v threads="$MINE_THREADS" -v cur="$CURRENT_NICE" -v base="$BASELINE_NICE" 'BEGIN {
+            other = ld - threads
+            if (cur == base) print (other > 0.5) ? 19 : base
+            else print (other > 0.1) ? 19 : base
+        }')"
+        if [[ "$TARGET_NICE" != "$CURRENT_NICE" ]]; then
+            renice -n "$TARGET_NICE" -p "$XMRIG_PID" >/dev/null 2>&1 && CURRENT_NICE="$TARGET_NICE"
+        fi
+
+        # Thermal governor: caps clock speed under whatever's currently
+        # running instead of stopping threads — xmrig itself is never
+        # touched (no restart, no RandomX dataset re-init), it just runs
+        # cooler and a bit slower until temperature allows clocking back
+        # up. Hardware safety, not a throughput optimization, so this
+        # applies regardless of THREADS_WAS_AUTO/explicit MINE_THREADS —
+        # unlike thread count, clock speed was never something the profile
+        # promised to hold fixed. A no-op wherever CPUFREQ_HW_MAX is 0 (no
+        # accessible cpufreq knob on this host).
+        if [[ -n "$TEMP" && "$CPUFREQ_HW_MAX" -gt 0 && "$CPUFREQ_WRITABLE" == true ]]; then
+            if awk -v t="$TEMP" -v hi="$TEMP_HIGH" 'BEGIN { exit !(t >= hi) }'; then
+                NEW_MAX_FREQ=$((CURRENT_MAX_FREQ - FREQ_STEP))
+                [[ "$NEW_MAX_FREQ" -lt "$CPUFREQ_HW_MIN" ]] && NEW_MAX_FREQ="$CPUFREQ_HW_MIN"
+                if [[ "$NEW_MAX_FREQ" -ne "$CURRENT_MAX_FREQ" ]]; then
+                    if set_cpu_max_freq "$NEW_MAX_FREQ"; then
+                        echo "   🌡️  ${TEMP}°C >= ${TEMP_HIGH}°C, capping max freq $((CURRENT_MAX_FREQ / 1000))MHz -> $((NEW_MAX_FREQ / 1000))MHz"
+                        CURRENT_MAX_FREQ="$NEW_MAX_FREQ"
+                    else
+                        echo "⚠️  cpufreq write failed (permission?), disabling thermal governor for this session" >&2
+                        CPUFREQ_WRITABLE=false
+                    fi
+                fi
+            elif awk -v t="$TEMP" -v ok="$TEMP_OK" 'BEGIN { exit !(t < ok) }' && [[ "$CURRENT_MAX_FREQ" -lt "$CPUFREQ_HW_MAX" ]]; then
+                NEW_MAX_FREQ=$((CURRENT_MAX_FREQ + FREQ_STEP))
+                [[ "$NEW_MAX_FREQ" -gt "$CPUFREQ_HW_MAX" ]] && NEW_MAX_FREQ="$CPUFREQ_HW_MAX"
+                if set_cpu_max_freq "$NEW_MAX_FREQ"; then
+                    echo "   🌡️  ${TEMP}°C < ${TEMP_OK}°C, releasing max freq $((CURRENT_MAX_FREQ / 1000))MHz -> $((NEW_MAX_FREQ / 1000))MHz"
+                    CURRENT_MAX_FREQ="$NEW_MAX_FREQ"
+                else
+                    echo "⚠️  cpufreq write failed (permission?), disabling thermal governor for this session" >&2
+                    CPUFREQ_WRITABLE=false
+                fi
+            fi
+        fi
+
+        # Recover threads once load has genuinely settled for a while — but
+        # only if the thread count came from auto-detection in the first
+        # place (an explicit MINE_THREADS is a deliberate cap, not a
+        # starting guess to grow back from) and temperature has actually
+        # come back down too, with its own separate margin (75 vs. the 85
+        # trigger) — otherwise this and the thermal check above would just
+        # fight each other back and forth right at the 85° line.
+        if [[ "$THREADS_WAS_AUTO" == true ]] && { [[ -z "$TEMP" ]] || awk -v t="$TEMP" -v ok="$TEMP_OK" 'BEGIN { exit !(t < ok) }'; }; then
+            IS_LOW="$(awk -v ld="$LOAD1" -v threads="$MINE_THREADS" 'BEGIN { print (ld - threads < 0.1) ? 1 : 0 }')"
+            if [[ "$IS_LOW" == 1 ]]; then
+                LOW_LOAD_STREAK=$((LOW_LOAD_STREAK + 1))
+            else
+                LOW_LOAD_STREAK=0
+            fi
+            if [[ "$LOW_LOAD_STREAK" -ge "$RECOVERY_STREAK_TARGET" ]]; then
+                NEW_THREADS="$(awk -v ld="$LOAD1" -v cores="$PHYSICAL_CORE_COUNT" 'BEGIN {
+                    busy = int(ld + 0.999)
+                    free = cores - busy
+                    if (free < 1) free = 1
+                    if (free > cores) free = cores
+                    print free
+                }')"
+                if [[ "$NEW_THREADS" -gt "$MINE_THREADS" ]]; then
+                    restart_with_threads "$NEW_THREADS" "load low for 20+ minutes, recovering"
+                fi
+                LOW_LOAD_STREAK=0
+            fi
+        fi
+
+        sleep 15
+    done
+) &
+CONTROL_LOOP_PID=$!
 
 if [[ "$IS_TTY" == true ]]; then
     (
@@ -226,9 +591,9 @@ if [[ "$IS_TTY" == true ]]; then
             if (( TICK % 30 == 0 )); then
                 STATS_JSON="$(fetch_pool_stats_json)"
                 if [[ -n "$STATS_JSON" ]]; then
-                    DUE=$(echo "$STATS_JSON" | grep -o '"amtDue":[0-9]*' | grep -o '[0-9]*')
-                    PAID=$(echo "$STATS_JSON" | grep -o '"amtPaid":[0-9]*' | grep -o '[0-9]*')
-                    SHARES=$(echo "$STATS_JSON" | grep -o '"validShares":[0-9]*' | grep -o '[0-9]*')
+                    DUE="$(parse_pool_field "$STATS_JSON" amtDue)"
+                    PAID="$(parse_pool_field "$STATS_JSON" amtPaid)"
+                    SHARES="$(parse_pool_field "$STATS_JSON" validShares)"
                     NOW=$(date +%s)
                     ETA_TEXT="calculating..."
                     if [[ -n "$PREV_DUE" && "$DUE" -gt "$PREV_DUE" ]]; then
@@ -265,9 +630,9 @@ if [[ "$IS_TTY" == true ]]; then
 else
     STATS_JSON="$(fetch_pool_stats_json)"
     if [[ -n "$STATS_JSON" ]]; then
-        DUE=$(echo "$STATS_JSON" | grep -o '"amtDue":[0-9]*' | grep -o '[0-9]*')
-        PAID=$(echo "$STATS_JSON" | grep -o '"amtPaid":[0-9]*' | grep -o '[0-9]*')
-        SHARES=$(echo "$STATS_JSON" | grep -o '"validShares":[0-9]*' | grep -o '[0-9]*')
+        DUE="$(parse_pool_field "$STATS_JSON" amtDue)"
+        PAID="$(parse_pool_field "$STATS_JSON" amtPaid)"
+        SHARES="$(parse_pool_field "$STATS_JSON" validShares)"
         awk -v due="${DUE:-0}" -v paid="${PAID:-0}" -v shares="${SHARES:-0}" 'BEGIN {
             printf "📊 XMR Pending: %.8f | XMR Paid: %.8f | Valid shares: %s\n", due/1e12, paid/1e12, shares
         }'
@@ -276,4 +641,7 @@ else
     fi
 fi
 
-wait "$XMRIG_PID"
+# Wait on the control loop, not a fixed xmrig PID — the loop restarts
+# xmrig internally when it recovers threads, so the original PID could
+# exit (intentionally) well before the session is actually done.
+wait "$CONTROL_LOOP_PID"

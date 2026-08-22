@@ -5,11 +5,16 @@
 
   outputs = { self, nixpkgs }:
     let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      forEachSystem = f: nixpkgs.lib.genAttrs systems f;
     in {
-      devShells.${system}.default = pkgs.mkShell {
-        packages = [ pkgs.xmrig pkgs.lm_sensors ];
-      };
+      devShells = forEachSystem (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in {
+          default = pkgs.mkShell {
+            packages = [ pkgs.xmrig ];
+          };
+        }
+      );
     };
 }
