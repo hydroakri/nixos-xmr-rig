@@ -183,6 +183,17 @@ in_http && /^[[:space:]]*\},?[[:space:]]*$/ { in_http=0 }
 # is a unique top-level key, safe for a plain sed (no block-scoping needed).
 sed -i -E 's/"autosave": *true/"autosave": false/' config.json
 
+# Force-corrected every run for the same reason: a config.json generated
+# before this existed may still have "hw-aes": true baked in from an
+# earlier config.json.example, which forces xmrig to use hardware AES
+# instructions regardless of whether this CPU actually has them —
+# confirmed live: crashes with SIGILL on a Raspberry Pi 4 (Cortex-A72
+# lacks the ARMv8 Crypto Extension), while silently fine on hardware that
+# does have it (e.g. Ryzen), which is exactly why this went unnoticed
+# until tested on different hardware. null lets xmrig auto-detect per-host
+# instead of assuming every CPU matches whichever one wrote the template.
+sed -i -E 's/"hw-aes": *(true|false|null)/"hw-aes": null/' config.json
+
 # Optional local override — gitignored, like wallet-address.local. Absent
 # by default: every physical core, full priority (see MINE_THREADS below).
 MINE_THREADS=""
