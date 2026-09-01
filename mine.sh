@@ -190,16 +190,31 @@ else
 fi
 
 # Force-enabled every run so configs generated before this existed also
-# pick it up. Loopback-only + restricted:true — GET /1/summary works with
-# no access-token, only write actions would need one. Scoped to just the
-# "http" block (awk state machine, not a blind sed) — "enabled" and "port"
-# both appear elsewhere in this file (cpu/opencl/cuda/pools[].enabled) and
-# a global replace would wrongly flip those too.
+# pick it up. Loopback-only. restricted:false + a per-run access-token
+# (below) instead of restricted:true — pause/resume (thermal escalation
+# further down) needs POST access to /json_rpc, which xmrig blocks
+# outright under restricted:true regardless of token; loopback-only bind
+# keeps this in the same local trust boundary as the MSR/cpufreq grants
+# already made above, the token is defense-in-depth against other local
+# users/processes, not network exposure. Scoped to just the "http" block
+# (awk state machine, not a blind sed) — "enabled" and "port" both appear
+# elsewhere in this file (cpu/opencl/cuda/pools[].enabled) and a global
+# replace would wrongly flip those too.
 XMRIG_API_PORT=18099
-awk -v port="$XMRIG_API_PORT" '
+# Reuse an already-injected token across runs (same persistence as the
+# wallet address — config.json is gitignored) rather than rotating it
+# every launch, which would just force a resume-mid-session token
+# mismatch for no benefit.
+XMRIG_API_TOKEN="$(grep -oP '"access-token": *"\K[^"]+' config.json 2>/dev/null)"
+if [[ -z "$XMRIG_API_TOKEN" ]]; then
+    XMRIG_API_TOKEN="$(head -c24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+fi
+awk -v port="$XMRIG_API_PORT" -v token="$XMRIG_API_TOKEN" '
 /"http": *\{/ { in_http=1 }
 in_http && /"enabled":/ { sub(/false/, "true") }
 in_http && /"port":/ { sub(/[0-9]+/, port) }
+in_http && /"access-token":/ { sub(/: *(null|"[^"]*")/, ": \"" token "\"") }
+in_http && /"restricted":/ { sub(/true/, "false") }
 in_http && /^[[:space:]]*\},?[[:space:]]*$/ { in_http=0 }
 { print }
 ' config.json > config.json.tmp && mv config.json.tmp config.json
@@ -229,10 +244,13 @@ MINE_HUGEPAGES=""
 MINE_CPU_PRIORITY=""
 MINE_TEMP_TARGET=""
 MINE_TEMP_DEADBAND=""
+MINE_PAUSE_ESCALATION_TICKS=""
+MINE_PAUSE_MIN_SECONDS=""
+MINE_PAUSE_MIN_RUN_SECONDS=""
 if [[ -f mining-profile.local ]]; then
     # shellcheck disable=SC1091
     source mining-profile.local
-    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-all}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default}, temp-target=${MINE_TEMP_TARGET:-80}°C±${MINE_TEMP_DEADBAND:-2})"
+    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-all}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default}, temp-target=${MINE_TEMP_TARGET:-80}°C±${MINE_TEMP_DEADBAND:-2}, pause-escalation=${MINE_PAUSE_ESCALATION_TICKS:-4} ticks/${MINE_PAUSE_MIN_SECONDS:-60}s/${MINE_PAUSE_MIN_RUN_SECONDS:-60}s)"
 fi
 
 # Always every physical core unless a profile explicitly caps it — no
@@ -242,6 +260,13 @@ fi
 if [[ -z "$MINE_THREADS" ]]; then
     MINE_THREADS="$PHYSICAL_CORE_COUNT"
 fi
+
+# The subset of PHYSICAL_CORE_LIST that actually ends up running a mining
+# thread — same derivation patch_thread_pin() uses for xmrig's "rx" pin
+# array below, computed once here so the thermal governor's file list
+# further down can reuse it instead of re-deriving it a second, divergeable
+# way.
+MINING_CORE_LIST="$(echo "$PHYSICAL_CORE_LIST" | cut -d, -f"1-${MINE_THREADS}")"
 
 # Decide fast vs light ourselves (from available RAM) instead of leaving
 # randomx.mode at xmrig's own "auto" — we're not confident enough in
@@ -283,7 +308,7 @@ fi
 # session, only thread count does), so those two are no-ops on later calls.
 patch_thread_pin() {
     local core_list threads_line
-    core_list="$(echo "$PHYSICAL_CORE_LIST" | cut -d, -f"1-${MINE_THREADS}")"
+    core_list="$MINING_CORE_LIST"
     threads_line="        \"rx\": [${core_list}],"
     awk -v threads_line="$threads_line" -v mode="$MINE_RANDOMX_MODE" -v prio="$MINE_CPU_PRIORITY" '
     /"cpu": *\{/ { in_cpu=1 }
@@ -356,7 +381,7 @@ else
     echo "⚠️  setcap failed, continuing without (hashrate will be slightly lower)" >&2
 fi
 
-# /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq is root:root 0644 —
+# /sys/devices/system/cpu/cpuN/cpufreq/scaling_max_freq is root:root 0644 —
 # chmod (not setfacl: sysfs doesn't actually persist POSIX ACLs, confirmed
 # by setfacl reporting success while the write still failed — chmod tested
 # and does work) grants this user write access one-time, like the
@@ -365,7 +390,17 @@ fi
 # unattended background loop can't provide. Only some drivers expose this
 # knob (this box's amd-pstate-epp does); where it's missing, thermal
 # response just quietly has nothing to act on below.
-CPUFREQ_MAX_FILES=(/sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq)
+#
+# Scoped to MINING_CORE_LIST (the same pinned subset patch_thread_pin used
+# for "rx"), not a blanket cpu* glob — one shared thermal sensor drives the
+# governor's readings, but heat only comes from the cores actually mining,
+# so a host running MINE_THREADS below its physical core count (idle cores
+# doing other work) shouldn't have those other cores capped too.
+IFS=',' read -ra MINING_CORE_IDS <<< "$MINING_CORE_LIST"
+CPUFREQ_MAX_FILES=()
+for _core in "${MINING_CORE_IDS[@]}"; do
+    CPUFREQ_MAX_FILES+=("/sys/devices/system/cpu/cpu${_core}/cpufreq/scaling_max_freq")
+done
 if [[ -e "${CPUFREQ_MAX_FILES[0]}" ]]; then
     if [[ -w "${CPUFREQ_MAX_FILES[0]}" ]]; then
         echo "   ✅ cpufreq scaling_max_freq already writable, skipping"
@@ -397,12 +432,12 @@ if [[ -e "${CPUFREQ_GOVERNOR_FILES[0]}" ]]; then
     fi
 fi
 
-# Writes $1 (kHz) to every core's scaling_max_freq — this, not thread-count
-# reduction, is the thermal governor's actual lever: it caps clock speed
-# under all currently-running threads instead of stopping some of them, so
-# xmrig itself is never touched (no restart, no RandomX dataset re-init,
-# no gap in hashing) — just runs cooler and a bit slower until temperature
-# allows clocking back up.
+# Writes $1 (kHz) to each mining-pinned core's scaling_max_freq — this, not
+# thread-count reduction, is the thermal governor's actual lever: it caps
+# clock speed under all currently-running threads instead of stopping some
+# of them, so xmrig itself is never touched (no restart, no RandomX dataset
+# re-init, no gap in hashing) — just runs cooler and a bit slower until
+# temperature allows clocking back up.
 set_cpu_max_freq() {
     local ok=true
     for f in "${CPUFREQ_MAX_FILES[@]}"; do
@@ -450,8 +485,31 @@ fetch_hashrate() {
     # xmrig's API JSON is pretty-printed with a space after the colon
     # ("total": [...], not "total":[...]) — matched that literally, not
     # against a synthetic guess, against a live instance's real output.
-    curl -s --max-time 2 "http://127.0.0.1:${XMRIG_API_PORT}/1/summary" 2>/dev/null \
+    # Auth header required now that config.json carries a real
+    # access-token (needed for pause/resume below) — restricted:false plus
+    # any token means xmrig's own isAuthRequired() applies to every route,
+    # this GET included, not just the write actions restricted:true used
+    # to gate alone.
+    curl -s --max-time 2 -H "Authorization: Bearer ${XMRIG_API_TOKEN}" \
+        "http://127.0.0.1:${XMRIG_API_PORT}/1/summary" 2>/dev/null \
         | grep -o '"total": *\[[0-9., null]*\]' | grep -oE '[0-9]+\.[0-9]+' | head -1
+}
+
+# Thermal escalation (further down) drives xmrig's pause/resume through
+# this. xmrig's HTTP API has no literal /1/pause route — POST /json_rpc is
+# the only non-GET endpoint, and the actual action ("pause"/"resume") is a
+# method name inside the JSON body, not part of the URL (confirmed against
+# xmrig 6.26.0 source, not guessed from the API's read-only GET routes).
+# Checks the real HTTP status, not just curl's own exit code, since curl
+# still exits 0 on a well-formed 4xx/5xx response.
+call_xmrig_rpc() {  # $1 = "pause" or "resume"
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST \
+        "http://127.0.0.1:${XMRIG_API_PORT}/json_rpc" \
+        -H "Authorization: Bearer ${XMRIG_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"$1\"}" 2>/dev/null)"
+    [[ "$code" == "200" ]]
 }
 
 fetch_cpu_temp() {
@@ -502,6 +560,20 @@ launch_xmrig() {
 # Runs regardless of TTY.
 (
     launch_xmrig
+
+    # Cross-subshell signal for the status bar loop below (a separate
+    # subshell, no shared variables) to know when xmrig is deliberately
+    # paused for cooling rather than actually broken — 0 H/s looks
+    # identical either way from the status loop's own vantage point.
+    # Reset unconditionally on every launch (not left to the TTY-only
+    # cleanup_bar trap) so a fresh run never inherits "cooling" from a
+    # prior killed session.
+    PAUSE_STATE_FILE="$BINARY_DIR/pause-state"
+    echo "running" > "$PAUSE_STATE_FILE"
+    PAUSE_STATE=running
+    HOT_AT_FLOOR_TICKS=0
+    PAUSE_STARTED_AT=0
+    LAST_RESUME_AT=0
 
     # Proportional control, not fixed-threshold bang-bang: step size scales
     # with how far off T_TARGET the reading is, so the loop converges to a
@@ -572,6 +644,67 @@ launch_xmrig() {
             fi
         fi
 
+        # Escalation of last resort: pausing xmrig outright via its own
+        # HTTP API, for hosts where frequency capping alone can't reach
+        # equilibrium (e.g. passive cooling under sustained 100% load —
+        # even the floor frequency may dissipate less heat than the
+        # heatsink can shed, so the governor above just keeps stepping
+        # down every tick without ever converging). Only engages once
+        # frequency capping has genuinely run out of room: pinned at
+        # CPUFREQ_HW_MIN, or no cpufreq lever exists at all/it already
+        # disabled itself (that second case matters — a board where
+        # scaling_max_freq was never writable in the first place could
+        # otherwise never reach "at the floor", and the safety net a
+        # passively-cooled board needs most would never engage) — and
+        # temperature is still over target regardless. Pool mining over a
+        # persistent stratum connection (PPLNS + keepalive) means pause
+        # timing has no relationship to Monero's block time: the pool
+        # pushes new jobs on its own whenever a block appears, and reward
+        # is proportional to shares contributed, not sensitive to *when*
+        # within a payout window a miner was active — so this is purely
+        # temperature-driven, no block-time-awareness needed.
+        AT_FLOOR=false
+        if [[ "$CPUFREQ_HW_MAX" -eq 0 || "$CPUFREQ_WRITABLE" == false ]]; then
+            AT_FLOOR=true
+        elif [[ "$CURRENT_MAX_FREQ" -eq "$CPUFREQ_HW_MIN" ]]; then
+            AT_FLOOR=true
+        fi
+        NOW="$(date +%s)"
+        if [[ "$PAUSE_STATE" == running ]]; then
+            if [[ "$AT_FLOOR" == true && -n "$TEMP" ]] && awk -v t="$TEMP" -v target="$T_TARGET" -v db="$TEMP_DEADBAND" 'BEGIN { exit !(t > target + db) }'; then
+                HOT_AT_FLOOR_TICKS=$((HOT_AT_FLOOR_TICKS + 1))
+            else
+                HOT_AT_FLOOR_TICKS=0
+            fi
+            if [[ "$HOT_AT_FLOOR_TICKS" -ge "${MINE_PAUSE_ESCALATION_TICKS:-4}" && $((NOW - LAST_RESUME_AT)) -ge "${MINE_PAUSE_MIN_RUN_SECONDS:-60}" ]]; then
+                if call_xmrig_rpc pause; then
+                    PAUSE_STATE=cooling
+                    PAUSE_STARTED_AT="$NOW"
+                    echo "cooling ${NOW}" > "$PAUSE_STATE_FILE"
+                    echo "   ❄️  ${TEMP}°C, frequency capping alone isn't enough — pausing xmrig to cool down"
+                else
+                    echo "⚠️  temp still high at frequency floor, but pause RPC call failed — will retry" >&2
+                fi
+            fi
+        else
+            # RPC failures here just retry next tick (unlike the freq
+            # governor's permanent self-disable above) — a network blip
+            # calling this last-resort safety net isn't the same class of
+            # failure as a permission grant that's presumably permanent,
+            # and self-disabling would defeat the whole point of it.
+            if [[ -n "$TEMP" ]] && awk -v t="$TEMP" -v target="$T_TARGET" -v db="$TEMP_DEADBAND" 'BEGIN { exit !(t < target - db) }' && [[ $((NOW - PAUSE_STARTED_AT)) -ge "${MINE_PAUSE_MIN_SECONDS:-60}" ]]; then
+                if call_xmrig_rpc resume; then
+                    PAUSE_STATE=running
+                    LAST_RESUME_AT="$NOW"
+                    HOT_AT_FLOOR_TICKS=0
+                    echo "running" > "$PAUSE_STATE_FILE"
+                    echo "   ✅ ${TEMP}°C, cooled down — resuming"
+                else
+                    echo "⚠️  cooled down but resume RPC call failed — will retry" >&2
+                fi
+            fi
+        fi
+
         sleep 15
     done
 ) &
@@ -626,7 +759,19 @@ if [[ "$IS_TTY" == true ]]; then
             fi
             TICK=$((TICK + 1))
 
-            draw_status "🌡️ ${TEMP:-N/A}°C | ⚡ ${HASHRATE:-N/A} H/s | ${POOL_PART}"
+            # A decaying-toward-zero H/s reading looks identical whether
+            # xmrig is deliberately paused to cool down or actually
+            # crashed — read the control loop's pause-state file (their
+            # only shared channel, two separate subshells otherwise don't
+            # see each other's variables) to tell the two apart.
+            HASHRATE_PART="⚡ ${HASHRATE:-N/A} H/s"
+            PAUSE_STATUS="$(cat "$BINARY_DIR/pause-state" 2>/dev/null)"
+            if [[ "$PAUSE_STATUS" == cooling* ]]; then
+                COOLING_SINCE="${PAUSE_STATUS#cooling }"
+                HASHRATE_PART="❄️  cooling down ($(( $(date +%s) - COOLING_SINCE ))s)"
+            fi
+
+            draw_status "🌡️ ${TEMP:-N/A}°C | ${HASHRATE_PART} | ${POOL_PART}"
             sleep 10
         done
     ) &

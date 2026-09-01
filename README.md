@@ -40,11 +40,12 @@ generated from `config.json.example` on first run.
 - Grants `cap_sys_rawio` + `cap_dac_override` on the xmrig binary (MSR mod;
   x86-only, harmlessly inert on ARM)
 - Grants this user write access (`chmod a+w`; sysfs doesn't honor POSIX
-  ACLs) on `cpufreq scaling_max_freq` for every core (where the driver
-  exposes it — this box's `amd-pstate-epp` does), so the thermal governor
-  below can cap/release clock speed later without a sudo prompt an
-  unattended background loop can't provide, then resets it to the
-  hardware max so the loop starts from a known-clean full-speed state
+  ACLs) on `cpufreq scaling_max_freq` for the mining-pinned cores only —
+  the same subset `MINE_THREADS` pins threads to, not every core (where
+  the driver exposes it — this box's `amd-pstate-epp` does) — so the
+  thermal governor below can cap/release clock speed later without a sudo
+  prompt an unattended background loop can't provide, then resets it to
+  the hardware max so the loop starts from a known-clean full-speed state
   regardless of what a prior session left it at
 - Force-enables xmrig's loopback HTTP API (port 18099, restricted) for the
   live hashrate reading below
@@ -68,18 +69,28 @@ generated from `config.json.example` on first run.
   `127.0.0.1:9050` if present and direct access is blocked). Piped/non-TTY
   runs get a single one-line pending/paid print instead of the bar.
 - Runs a control loop for the life of the process that adjusts
-  `scaling_max_freq` on every core every 15s using proportional control
-  (step size scales with the temperature error, not a fixed-threshold
-  trigger) targeting 80°C ±2°C — converges to a stable frequency in 1-2
-  ticks under sustained load instead of oscillating off a hard cap
-  threshold and back. Capping (too hot) is twice as sensitive as releasing
-  (cooler than target): overshooting down only costs a little throughput,
-  overshooting up risks tripping the hardware's own PROCHOT before the
-  next tick catches it. Hardware safety, not a throughput optimization, so
-  it applies regardless of thread count. Doesn't touch xmrig at all (no
-  restart, no RandomX dataset re-init) — just clocks down whatever's
-  currently running. A no-op wherever the cpufreq grant above wasn't
-  possible.
+  `scaling_max_freq` on the mining-pinned cores (same subset as the thread
+  pin, not every core — one thermal sensor drives the reading, but only
+  those cores are generating the heat, so a host running fewer mining
+  threads than physical cores doesn't needlessly cap the other cores'
+  unrelated work) every 15s using proportional control (step size scales
+  with the temperature error, not a fixed-threshold trigger) targeting
+  80°C ±2°C — converges to a stable frequency in 1-2 ticks under sustained
+  load instead of oscillating off a hard cap threshold and back. Capping
+  (too hot) is twice as sensitive as releasing (cooler than target):
+  overshooting down only costs a little throughput, overshooting up risks
+  tripping the hardware's own PROCHOT before the next tick catches it.
+  Hardware safety, not a throughput optimization, so it applies regardless
+  of thread count. Doesn't touch xmrig at all (no restart, no RandomX
+  dataset re-init) — just clocks down whatever's currently running. A
+  no-op wherever the cpufreq grant above wasn't possible.
+- If frequency capping alone reaches the hardware's floor and temperature
+  is still over target, the same loop escalates to pausing xmrig outright
+  via its own HTTP API (`json_rpc` `pause`/`resume`, loopback-only,
+  token-authenticated) until it cools back down — the last resort for
+  hardware (e.g. passive cooling) where no sustainable-forever frequency
+  actually stays cool enough. Purely temperature-driven, not a fixed
+  timer; see `MINE_PAUSE_*` below.
 
 Sudo is only invoked when state actually needs to change. Huge pages and
 the capability grant persist until reboot.
@@ -101,8 +112,11 @@ MINE_THREADS=1          # cap CPU threads (default: unset = every physical core)
 MINE_RANDOMX_MODE=light # force fast/light (default: unset = auto from available RAM)
 MINE_HUGEPAGES=0         # override the huge-pages page count, 0 disables it (default: unset = auto)
 MINE_CPU_PRIORITY=1      # xmrig's own 0-5 internal thread priority (default: unset)
-MINE_TEMP_TARGET=70      # thermal governor's target °C (default: unset = 80)
-MINE_TEMP_DEADBAND=3     # +/-°C dead zone around the target (default: unset = 2)
+MINE_TEMP_TARGET=70              # thermal governor's target °C (default: unset = 80)
+MINE_TEMP_DEADBAND=3             # +/-°C dead zone around the target (default: unset = 2)
+MINE_PAUSE_ESCALATION_TICKS=4    # governor ticks pinned at the freq floor before pausing (default: unset = 4, ~60s)
+MINE_PAUSE_MIN_SECONDS=60        # minimum time paused before resume is considered (default: unset = 60)
+MINE_PAUSE_MIN_RUN_SECONDS=60    # minimum time back at full hashing before pausing again (default: unset = 60)
 ```
 
 `MINE_TEMP_TARGET`/`MINE_TEMP_DEADBAND` matter most on hosts with weak or
@@ -111,6 +125,20 @@ passive cooling (e.g. a Raspberry Pi) that never comfortably reach the
 clock speed earlier and settle at a lower steady-state frequency, trading
 some throughput for staying further from the hardware's real thermal
 limit.
+
+The `MINE_PAUSE_*` knobs tune a second, last-resort escalation: on
+hardware where frequency capping alone can't reach equilibrium (passive
+cooling under sustained 100% load may run hotter at the floor frequency
+than the heatsink can shed), the control loop pauses xmrig outright via
+its own HTTP API once frequency capping has run out of room and
+temperature is still over target, then resumes once it's cooled back
+down — temperature-driven, not a fixed timer. This is pool mining over a
+persistent connection (PPLNS reward, `keepalive: true`), so pause timing
+has no relationship to Monero's block time — the pool pushes new jobs on
+its own whenever a block appears, and reward is proportional to shares
+contributed, not sensitive to when within a payout window a miner was
+active. These defaults are a conservative starting point, not tuned
+against real hardware yet.
 
 ## Notes
 
