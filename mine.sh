@@ -135,7 +135,7 @@ fi
 echo "💰 Injecting wallet address from wallet-address.local (kept out of git — config.json.example only ever holds a placeholder)"
 WALLET_ADDRESS_FILE="wallet-address.local"
 if [[ -f "$WALLET_ADDRESS_FILE" ]]; then
-    WALLET_ADDRESS="$(tr -d '[:space:]' < "$WALLET_ADDRESS_FILE")"
+    WALLET_ADDRESS="$(tr -d '[:space:]' <"$WALLET_ADDRESS_FILE")"
     sed -i -E "s/\"user\": *\"[^\"]*\"/\"user\": \"${WALLET_ADDRESS}\"/" config.json
     echo "   ✅ wallet address injected"
     echo "   📊 dashboard: https://www.supportxmr.com/#/dashboard?wallet=${WALLET_ADDRESS}"
@@ -217,7 +217,7 @@ in_http && /"access-token":/ { sub(/: *(null|"[^"]*")/, ": \"" token "\"") }
 in_http && /"restricted":/ { sub(/true/, "false") }
 in_http && /^[[:space:]]*\},?[[:space:]]*$/ { in_http=0 }
 { print }
-' config.json > config.json.tmp && mv config.json.tmp config.json
+' config.json >config.json.tmp && mv config.json.tmp config.json
 
 # Force-disabled every run too — xmrig's autosave would otherwise write
 # back per-host thread arrays on exit, and a config.json from before this
@@ -251,15 +251,15 @@ sed -i -E 's/"hw-aes": *(true|false|null)/"hw-aes": null/' config.json
 # written on.
 DEFAULT_TEMP_ARCH="$(uname -m)"
 if [[ "$DEFAULT_TEMP_ARCH" == aarch64 || "$DEFAULT_TEMP_ARCH" == arm* ]]; then
-    DEFAULT_T_TARGET=65    # SBC-class (e.g. Raspberry Pi) — much less
-    DEFAULT_TEMP_DEADBAND=3 # thermal headroom than a laptop/desktop
+    DEFAULT_T_TARGET=67       # SBC-class (e.g. Raspberry Pi) — much less
+    DEFAULT_TEMP_DEADBAND=2.6 # thermal headroom than a laptop/desktop
 elif compgen -G "/sys/class/power_supply/BAT*" >/dev/null 2>&1; then
-    DEFAULT_T_TARGET=80    # laptop — battery presence as the signal,
-    DEFAULT_TEMP_DEADBAND=2 # the one class genuinely built for sustained
-                             # higher internal temps
+    DEFAULT_T_TARGET=77       # laptop — battery presence as the signal,
+    DEFAULT_TEMP_DEADBAND=2.6 # the one class genuinely built for sustained
+    # higher internal temps
 else
-    DEFAULT_T_TARGET=72    # desktop (the fallback — neither ARM nor
-    DEFAULT_TEMP_DEADBAND=2 # battery-powered)
+    DEFAULT_T_TARGET=77     # desktop (the fallback — neither ARM nor
+    DEFAULT_TEMP_DEADBAND=3 # battery-powered)
 fi
 
 # Optional local override — gitignored, like wallet-address.local. Absent
@@ -363,7 +363,7 @@ patch_thread_pin() {
     in_rx && /"mode":/ && mode != "" { sub(/"mode": *"[a-z]+"/, "\"mode\": \"" mode "\"") }
     in_rx && /^[[:space:]]*\},?[[:space:]]*$/ { in_rx=0 }
     { print }
-    ' config.json > config.json.tmp && mv config.json.tmp config.json
+    ' config.json >config.json.tmp && mv config.json.tmp config.json
 }
 patch_thread_pin
 echo "   ✅ config.json set to randomx-mode=${MINE_RANDOMX_MODE}, threads=${MINE_THREADS}${MINE_CPU_PRIORITY:+, cpu-priority=$MINE_CPU_PRIORITY}"
@@ -439,7 +439,7 @@ fi
 # governor's readings, but heat only comes from the cores actually mining,
 # so a host running MINE_THREADS below its physical core count (idle cores
 # doing other work) shouldn't have those other cores capped too.
-IFS=',' read -ra MINING_CORE_IDS <<< "$MINING_CORE_LIST"
+IFS=',' read -ra MINING_CORE_IDS <<<"$MINING_CORE_LIST"
 CPUFREQ_MAX_FILES=()
 for _core in "${MINING_CORE_IDS[@]}"; do
     CPUFREQ_MAX_FILES+=("/sys/devices/system/cpu/cpu${_core}/cpufreq/scaling_max_freq")
@@ -484,7 +484,7 @@ fi
 set_cpu_max_freq() {
     local ok=true
     for f in "${CPUFREQ_MAX_FILES[@]}"; do
-        echo "$1" > "$f" 2>/dev/null || ok=false
+        echo "$1" >"$f" 2>/dev/null || ok=false
     done
     [[ "$ok" == true ]]
 }
@@ -534,8 +534,8 @@ fetch_hashrate() {
     # this GET included, not just the write actions restricted:true used
     # to gate alone.
     curl -s --max-time 2 -H "Authorization: Bearer ${XMRIG_API_TOKEN}" \
-        "http://127.0.0.1:${XMRIG_API_PORT}/1/summary" 2>/dev/null \
-        | grep -o '"total": *\[[0-9., null]*\]' | grep -oE '[0-9]+\.[0-9]+' | head -1
+        "http://127.0.0.1:${XMRIG_API_PORT}/1/summary" 2>/dev/null |
+        grep -o '"total": *\[[0-9., null]*\]' | grep -oE '[0-9]+\.[0-9]+' | head -1
 }
 
 # xmrig's own "paused" field in /1/summary is the authoritative signal
@@ -547,8 +547,8 @@ fetch_hashrate() {
 # as indistinguishable from a crash (decaying H/s, no explanation).
 fetch_xmrig_paused() {
     curl -s --max-time 2 -H "Authorization: Bearer ${XMRIG_API_TOKEN}" \
-        "http://127.0.0.1:${XMRIG_API_PORT}/1/summary" 2>/dev/null \
-        | grep -o '"paused": *[a-z]*' | grep -o '[a-z]*$'
+        "http://127.0.0.1:${XMRIG_API_PORT}/1/summary" 2>/dev/null |
+        grep -o '"paused": *[a-z]*' | grep -o '[a-z]*$'
 }
 
 # Thermal escalation (further down) drives xmrig's pause/resume through
@@ -558,7 +558,7 @@ fetch_xmrig_paused() {
 # xmrig 6.26.0 source, not guessed from the API's read-only GET routes).
 # Checks the real HTTP status, not just curl's own exit code, since curl
 # still exits 0 on a well-formed 4xx/5xx response.
-call_xmrig_rpc() {  # $1 = "pause" or "resume"
+call_xmrig_rpc() { # $1 = "pause" or "resume"
     local code
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST \
         "http://127.0.0.1:${XMRIG_API_PORT}/json_rpc" \
@@ -666,11 +666,27 @@ launch_xmrig() {
     # cleanup_bar trap) so a fresh run never inherits "cooling" from a
     # prior killed session.
     PAUSE_STATE_FILE="$BINARY_DIR/pause-state"
-    echo "running" > "$PAUSE_STATE_FILE"
+    echo "running" >"$PAUSE_STATE_FILE"
     PAUSE_STATE=running
     HOT_AT_FLOOR_TICKS=0
     PAUSE_STARTED_AT=0
     LAST_RESUME_AT=0
+    # Adaptive minimum pause duration — same problem the fixed-step
+    # frequency governor had before proportional control fixed it (a
+    # constant response decoupled from how well it's actually working),
+    # but pause/resume has no continuous dial to step, only on/off, so
+    # the fix here is a different shape: the *duration* backs off when a
+    # pause clearly wasn't enough (resumed, then reheated and needed to
+    # pause again almost immediately) and shrinks back down when cooling
+    # is clearly fast (satisfied the resume condition well before the
+    # minimum even elapsed) — so a host that's genuinely borderline
+    # converges to whatever duration actually works instead of retrying
+    # the same guess forever, and a host that cools quickly doesn't keep
+    # paying for a longer-than-needed minimum once it's proven unnecessary.
+    PAUSE_MIN_BASE="${MINE_PAUSE_MIN_SECONDS:-60}"
+    PAUSE_MIN_RUN_BASE="${MINE_PAUSE_MIN_RUN_SECONDS:-60}"
+    PAUSE_MIN_SECONDS_CURRENT="$PAUSE_MIN_BASE"
+    PAUSE_TEMP_OK_AT=0
 
     # Proportional control, not fixed-threshold bang-bang: step size scales
     # with how far off T_TARGET the reading is, so the loop converges to a
@@ -683,19 +699,19 @@ launch_xmrig() {
     # the top of the script, inherited here from the parent shell.
     T_TARGET="${MINE_TEMP_TARGET:-$DEFAULT_T_TARGET}"
     TEMP_DEADBAND="${MINE_TEMP_DEADBAND:-$DEFAULT_TEMP_DEADBAND}" # absorbs sensor read noise
-                                                                    # instead of chasing every jitter
+    # instead of chasing every jitter
     # Max per-tick swing, same magnitude as the old fixed step (10% of the
     # hardware's freq range) — the proportional response is clamped to
     # this, so one bad reading can't slam frequency to an extreme in one
     # tick.
-    FREQ_STEP_MAX=$(( (CPUFREQ_HW_MAX - CPUFREQ_HW_MIN) / 10 ))
+    FREQ_STEP_MAX=$(((CPUFREQ_HW_MAX - CPUFREQ_HW_MIN) / 10))
     # Asymmetric gain: capping (too hot) reaches full step at 5°C past the
     # deadband, releasing (cooler than target) only at 10°C past it — twice
     # as sensitive capping down as releasing up. Overshooting on the down
     # side only costs a little throughput; overshooting up risks tripping
     # the hardware's own PROCHOT before this loop's next 15s tick catches it.
-    KP_DOWN=$(( FREQ_STEP_MAX / 5 ))
-    KP_UP=$(( FREQ_STEP_MAX / 10 ))
+    KP_DOWN=$((FREQ_STEP_MAX / 5))
+    KP_UP=$((FREQ_STEP_MAX / 10))
     CURRENT_MAX_FREQ="$CPUFREQ_HW_MAX"
     # Optimistic until proven otherwise — self-disables the first time an
     # actual write fails, rather than retrying (and re-logging) every 15s
@@ -775,28 +791,67 @@ launch_xmrig() {
             else
                 HOT_AT_FLOOR_TICKS=0
             fi
-            if [[ "$HOT_AT_FLOOR_TICKS" -ge "${MINE_PAUSE_ESCALATION_TICKS:-4}" && $((NOW - LAST_RESUME_AT)) -ge "${MINE_PAUSE_MIN_RUN_SECONDS:-60}" ]]; then
+            if [[ "$HOT_AT_FLOOR_TICKS" -ge "${MINE_PAUSE_ESCALATION_TICKS:-4}" && $((NOW - LAST_RESUME_AT)) -ge "$PAUSE_MIN_RUN_BASE" ]]; then
                 if call_xmrig_rpc pause; then
+                    # Oscillation check: only meaningful from the second
+                    # pause onward (LAST_RESUME_AT is still 0 the very
+                    # first time). A run that barely cleared the
+                    # PAUSE_MIN_RUN_BASE gate before needing to pause
+                    # again means the last pause didn't buy enough
+                    # margin — back off by doubling, capped at 8x base so
+                    # a persistently bad host still converges somewhere
+                    # rather than growing without bound.
+                    if [[ "$LAST_RESUME_AT" -gt 0 && $((NOW - LAST_RESUME_AT)) -lt $((PAUSE_MIN_RUN_BASE * 2)) ]]; then
+                        PAUSE_MIN_SECONDS_CURRENT=$((PAUSE_MIN_SECONDS_CURRENT * 2))
+                        pause_cap=$((PAUSE_MIN_BASE * 8))
+                        [[ "$PAUSE_MIN_SECONDS_CURRENT" -gt "$pause_cap" ]] && PAUSE_MIN_SECONDS_CURRENT="$pause_cap"
+                        echo "   ⏫ only ran $((NOW - LAST_RESUME_AT))s before overheating again — extending minimum pause to ${PAUSE_MIN_SECONDS_CURRENT}s"
+                    fi
                     PAUSE_STATE=cooling
                     PAUSE_STARTED_AT="$NOW"
-                    echo "cooling ${NOW}" > "$PAUSE_STATE_FILE"
+                    PAUSE_TEMP_OK_AT=0
+                    echo "cooling ${NOW}" >"$PAUSE_STATE_FILE"
                     echo "   ❄️  ${TEMP}°C, frequency capping alone isn't enough — pausing xmrig to cool down"
                 else
                     echo "⚠️  temp still high at frequency floor, but pause RPC call failed — will retry" >&2
                 fi
             fi
         else
+            # Track the first tick temp actually satisfies the resume
+            # condition, independent of whether the minimum-duration gate
+            # below has elapsed yet — this is what lets a fast-cooling
+            # host be recognized as such even while still waiting out the
+            # minimum, instead of only ever seeing "resumed at exactly
+            # the minimum" and never learning the minimum is more than
+            # it needs.
+            if [[ "$PAUSE_TEMP_OK_AT" -eq 0 && -n "$TEMP" ]] && awk -v t="$TEMP" -v target="$T_TARGET" -v db="$TEMP_DEADBAND" 'BEGIN { exit !(t < target - db) }'; then
+                PAUSE_TEMP_OK_AT="$NOW"
+            fi
             # RPC failures here just retry next tick (unlike the freq
             # governor's permanent self-disable above) — a network blip
             # calling this last-resort safety net isn't the same class of
             # failure as a permission grant that's presumably permanent,
             # and self-disabling would defeat the whole point of it.
-            if [[ -n "$TEMP" ]] && awk -v t="$TEMP" -v target="$T_TARGET" -v db="$TEMP_DEADBAND" 'BEGIN { exit !(t < target - db) }' && [[ $((NOW - PAUSE_STARTED_AT)) -ge "${MINE_PAUSE_MIN_SECONDS:-60}" ]]; then
+            if [[ -n "$TEMP" ]] && awk -v t="$TEMP" -v target="$T_TARGET" -v db="$TEMP_DEADBAND" 'BEGIN { exit !(t < target - db) }' && [[ $((NOW - PAUSE_STARTED_AT)) -ge "$PAUSE_MIN_SECONDS_CURRENT" ]]; then
                 if call_xmrig_rpc resume; then
+                    # Shrink check: if it satisfied the resume condition
+                    # in well under half the current minimum, that
+                    # minimum is more conservative than this cooldown
+                    # actually needed — ease back toward the configured
+                    # base rather than paying the inflated duration
+                    # forever once it's proven unnecessary.
+                    if [[ "$PAUSE_TEMP_OK_AT" -gt 0 ]]; then
+                        cool_time=$((PAUSE_TEMP_OK_AT - PAUSE_STARTED_AT))
+                        if [[ "$cool_time" -lt $((PAUSE_MIN_SECONDS_CURRENT / 2)) ]]; then
+                            PAUSE_MIN_SECONDS_CURRENT=$((PAUSE_MIN_SECONDS_CURRENT / 2))
+                            [[ "$PAUSE_MIN_SECONDS_CURRENT" -lt "$PAUSE_MIN_BASE" ]] && PAUSE_MIN_SECONDS_CURRENT="$PAUSE_MIN_BASE"
+                            echo "   ⏬ cooled in ${cool_time}s, well under the minimum — shrinking to ${PAUSE_MIN_SECONDS_CURRENT}s"
+                        fi
+                    fi
                     PAUSE_STATE=running
                     LAST_RESUME_AT="$NOW"
                     HOT_AT_FLOOR_TICKS=0
-                    echo "running" > "$PAUSE_STATE_FILE"
+                    echo "running" >"$PAUSE_STATE_FILE"
                     echo "   ✅ ${TEMP}°C, cooled down — resuming"
                 else
                     echo "⚠️  cooled down but resume RPC call failed — will retry" >&2
@@ -824,7 +879,7 @@ if [[ "$IS_TTY" == true ]]; then
             HASHRATE="$(fetch_hashrate)"
             TEMP="$(fetch_cpu_temp)"
 
-            if (( TICK % 30 == 0 )); then
+            if ((TICK % 30 == 0)); then
                 STATS_JSON="$(fetch_pool_stats_json)"
                 if [[ -n "$STATS_JSON" ]]; then
                     DUE="$(parse_pool_field "$STATS_JSON" amtDue)"
@@ -872,7 +927,7 @@ if [[ "$IS_TTY" == true ]]; then
             PAUSE_STATUS="$(cat "$BINARY_DIR/pause-state" 2>/dev/null)"
             if [[ "$PAUSE_STATUS" == cooling* ]]; then
                 COOLING_SINCE="${PAUSE_STATUS#cooling }"
-                HASHRATE_PART="❄️  cooling down ($(( $(date +%s) - COOLING_SINCE ))s)"
+                HASHRATE_PART="❄️  cooling down ($(($(date +%s) - COOLING_SINCE))s)"
             elif [[ "$(fetch_xmrig_paused)" == "true" ]]; then
                 HASHRATE_PART="🔌 paused (on battery?)"
             fi

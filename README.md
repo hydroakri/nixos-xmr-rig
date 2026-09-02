@@ -124,7 +124,7 @@ MINE_CPU_PRIORITY=1      # xmrig's own 0-5 internal thread priority (default: un
 MINE_TEMP_TARGET=70              # thermal governor's target °C (default: unset = device-type-detected, see below)
 MINE_TEMP_DEADBAND=3             # +/-°C dead zone around the target (default: unset = device-type-detected)
 MINE_PAUSE_ESCALATION_TICKS=4    # governor ticks pinned at the freq floor before pausing (default: unset = 4, ~60s)
-MINE_PAUSE_MIN_SECONDS=60        # minimum time paused before resume is considered (default: unset = 60)
+MINE_PAUSE_MIN_SECONDS=60        # starting minimum pause duration, adapts from here (default: unset = 60)
 MINE_PAUSE_MIN_RUN_SECONDS=60    # minimum time back at full hashing before pausing again (default: unset = 60)
 MINE_ALLOW_BATTERY_MINING=1      # keep mining on battery power instead of auto-pausing (default: unset = pause on battery)
 ```
@@ -161,6 +161,19 @@ its own whenever a block appears, and reward is proportional to shares
 contributed, not sensitive to when within a payout window a miner was
 active. These defaults are a conservative starting point, not tuned
 against real hardware yet.
+
+The minimum pause duration (`MINE_PAUSE_MIN_SECONDS`) is a starting
+point, not a fixed constant — it adapts at runtime the same way the old
+fixed-threshold frequency governor couldn't (that's what proportional
+control fixed there, but pause/resume has no continuous dial to step,
+only on/off, so the fix takes a different shape here). If a pause
+resumes and then overheats again within roughly 2x
+`MINE_PAUSE_MIN_RUN_SECONDS`, that pause clearly wasn't long enough — the
+next one's minimum doubles, capped at 8x the starting value. If a pause
+satisfies the resume condition in under half the current minimum, that
+minimum is more conservative than this host needs — it halves back down,
+floored at the starting value. A host settles at whatever duration
+actually works instead of retrying the same guess indefinitely.
 
 ## Notes
 
