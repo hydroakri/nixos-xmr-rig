@@ -92,6 +92,14 @@ generated from `config.json.example` on first run.
   hardware (e.g. passive cooling) where no sustainable-forever frequency
   actually stays cool enough. Purely temperature-driven, not a fixed
   timer; see `MINE_PAUSE_*` below.
+- Force-enables xmrig's own built-in `pause-on-battery` (opt-out, not
+  opt-in — see `MINE_ALLOW_BATTERY_MINING` below) so a laptop pauses
+  mining the moment it's unplugged and resumes automatically once AC
+  power returns — the same underlying pause/resume mechanism as the
+  thermal escalation above, just triggered by power source instead of
+  temperature. Native to xmrig rather than something polled from sysfs
+  here, since xmrig already needs to detect this reliably for its own
+  purposes.
 
 Sudo is only invoked when state actually needs to change. Huge pages and
 the capability grant persist until reboot.
@@ -118,6 +126,7 @@ MINE_TEMP_DEADBAND=3             # +/-°C dead zone around the target (default: 
 MINE_PAUSE_ESCALATION_TICKS=4    # governor ticks pinned at the freq floor before pausing (default: unset = 4, ~60s)
 MINE_PAUSE_MIN_SECONDS=60        # minimum time paused before resume is considered (default: unset = 60)
 MINE_PAUSE_MIN_RUN_SECONDS=60    # minimum time back at full hashing before pausing again (default: unset = 60)
+MINE_ALLOW_BATTERY_MINING=1      # keep mining on battery power instead of auto-pausing (default: unset = pause on battery)
 ```
 
 When `MINE_TEMP_TARGET`/`MINE_TEMP_DEADBAND` aren't set, `mine.sh` picks a

@@ -273,10 +273,27 @@ MINE_TEMP_DEADBAND=""
 MINE_PAUSE_ESCALATION_TICKS=""
 MINE_PAUSE_MIN_SECONDS=""
 MINE_PAUSE_MIN_RUN_SECONDS=""
+MINE_ALLOW_BATTERY_MINING=""
 if [[ -f mining-profile.local ]]; then
     # shellcheck disable=SC1091
     source mining-profile.local
-    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-all}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default}, temp-target=${MINE_TEMP_TARGET:-$DEFAULT_T_TARGET}°C±${MINE_TEMP_DEADBAND:-$DEFAULT_TEMP_DEADBAND}, pause-escalation=${MINE_PAUSE_ESCALATION_TICKS:-4} ticks/${MINE_PAUSE_MIN_SECONDS:-60}s/${MINE_PAUSE_MIN_RUN_SECONDS:-60}s)"
+    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-all}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default}, temp-target=${MINE_TEMP_TARGET:-$DEFAULT_T_TARGET}°C±${MINE_TEMP_DEADBAND:-$DEFAULT_TEMP_DEADBAND}, pause-escalation=${MINE_PAUSE_ESCALATION_TICKS:-4} ticks/${MINE_PAUSE_MIN_SECONDS:-60}s/${MINE_PAUSE_MIN_RUN_SECONDS:-60}s, battery-mining=${MINE_ALLOW_BATTERY_MINING:-off})"
+fi
+
+# Force-corrected every run, like autosave/hw-aes above — a config.json
+# generated before this existed may still have "pause-on-battery": false
+# baked in from an earlier template. xmrig's own built-in pause-on-battery
+# (same underlying pause/resume mechanism the thermal escalation loop
+# uses further down, live-verified elsewhere in this session to keep the
+# stratum connection alive through a pause) is a more reliable AC/battery
+# detector than anything we'd poll from sysfs ourselves, so just let
+# xmrig own this instead of duplicating it. Opt-out (not opt-in) — a
+# laptop draining its battery to mine unattended is exactly the kind of
+# thing that should require a deliberate choice, not be the default.
+if [[ "$MINE_ALLOW_BATTERY_MINING" == "1" ]]; then
+    sed -i -E 's/"pause-on-battery": *(true|false)/"pause-on-battery": false/' config.json
+else
+    sed -i -E 's/"pause-on-battery": *(true|false)/"pause-on-battery": true/' config.json
 fi
 
 # Always every physical core unless a profile explicitly caps it — no
@@ -519,6 +536,19 @@ fetch_hashrate() {
     curl -s --max-time 2 -H "Authorization: Bearer ${XMRIG_API_TOKEN}" \
         "http://127.0.0.1:${XMRIG_API_PORT}/1/summary" 2>/dev/null \
         | grep -o '"total": *\[[0-9., null]*\]' | grep -oE '[0-9]+\.[0-9]+' | head -1
+}
+
+# xmrig's own "paused" field in /1/summary is the authoritative signal
+# for whether it's currently hashing — not just for pauses our own
+# control loop triggers (thermal escalation), but also ones xmrig
+# decides on its own (pause-on-battery, further up) that this script
+# never sees a call for. Without this, the status bar below would only
+# know about pauses it caused itself and show a battery-triggered pause
+# as indistinguishable from a crash (decaying H/s, no explanation).
+fetch_xmrig_paused() {
+    curl -s --max-time 2 -H "Authorization: Bearer ${XMRIG_API_TOKEN}" \
+        "http://127.0.0.1:${XMRIG_API_PORT}/1/summary" 2>/dev/null \
+        | grep -o '"paused": *[a-z]*' | grep -o '[a-z]*$'
 }
 
 # Thermal escalation (further down) drives xmrig's pause/resume through
@@ -829,15 +859,22 @@ if [[ "$IS_TTY" == true ]]; then
             TICK=$((TICK + 1))
 
             # A decaying-toward-zero H/s reading looks identical whether
-            # xmrig is deliberately paused to cool down or actually
-            # crashed — read the control loop's pause-state file (their
-            # only shared channel, two separate subshells otherwise don't
-            # see each other's variables) to tell the two apart.
+            # xmrig is paused or actually crashed — and it can be paused
+            # for two different reasons from two different sources: our
+            # own control loop (thermal escalation, tracked in the
+            # pause-state file, the only channel between these two
+            # otherwise-variable-isolated subshells) or xmrig deciding on
+            # its own (pause-on-battery), which this script never gets a
+            # call for and so has no other way to know about. Check the
+            # pause-state file first since it also carries a "since when"
+            # timestamp the generic API field doesn't.
             HASHRATE_PART="⚡ ${HASHRATE:-N/A} H/s"
             PAUSE_STATUS="$(cat "$BINARY_DIR/pause-state" 2>/dev/null)"
             if [[ "$PAUSE_STATUS" == cooling* ]]; then
                 COOLING_SINCE="${PAUSE_STATUS#cooling }"
                 HASHRATE_PART="❄️  cooling down ($(( $(date +%s) - COOLING_SINCE ))s)"
+            elif [[ "$(fetch_xmrig_paused)" == "true" ]]; then
+                HASHRATE_PART="🔌 paused (on battery?)"
             fi
 
             draw_status "🌡️ ${TEMP:-N/A}°C | ${HASHRATE_PART} | ${POOL_PART}"
