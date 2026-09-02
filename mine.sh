@@ -236,6 +236,32 @@ sed -i -E 's/"autosave": *true/"autosave": false/' config.json
 # instead of assuming every CPU matches whichever one wrote the template.
 sed -i -E 's/"hw-aes": *(true|false|null)/"hw-aes": null/' config.json
 
+# Default thermal target/deadband, only used where MINE_TEMP_TARGET isn't
+# set explicitly in mining-profile.local below. A single flat default
+# doesn't fit every device class — conservative long-term (not just
+# "won't immediately fail") internal-temp ceilings differ a lot by how a
+# device is built to shed heat: an SBC like a Raspberry Pi (passive/
+# minimal cooling, small thermal mass) is only rated for sustained
+# operation up to ~70°C; a gaming laptop's beefier cooling is built for
+# sustained 50-85°C; a desktop's case airflow sits in between, ~35-75°C.
+# Each default here targets the middle of its class's long-term-safe
+# band, not the edge of it. Detected, not asked for, so a host that never
+# gets a profile override (the common case) still gets a sane target
+# instead of inheriting whichever device this script happened to be
+# written on.
+DEFAULT_TEMP_ARCH="$(uname -m)"
+if [[ "$DEFAULT_TEMP_ARCH" == aarch64 || "$DEFAULT_TEMP_ARCH" == arm* ]]; then
+    DEFAULT_T_TARGET=65    # SBC-class (e.g. Raspberry Pi) — much less
+    DEFAULT_TEMP_DEADBAND=3 # thermal headroom than a laptop/desktop
+elif compgen -G "/sys/class/power_supply/BAT*" >/dev/null 2>&1; then
+    DEFAULT_T_TARGET=80    # laptop — battery presence as the signal,
+    DEFAULT_TEMP_DEADBAND=2 # the one class genuinely built for sustained
+                             # higher internal temps
+else
+    DEFAULT_T_TARGET=72    # desktop (the fallback — neither ARM nor
+    DEFAULT_TEMP_DEADBAND=2 # battery-powered)
+fi
+
 # Optional local override — gitignored, like wallet-address.local. Absent
 # by default: every physical core, full priority (see MINE_THREADS below).
 MINE_THREADS=""
@@ -250,7 +276,7 @@ MINE_PAUSE_MIN_RUN_SECONDS=""
 if [[ -f mining-profile.local ]]; then
     # shellcheck disable=SC1091
     source mining-profile.local
-    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-all}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default}, temp-target=${MINE_TEMP_TARGET:-80}°C±${MINE_TEMP_DEADBAND:-2}, pause-escalation=${MINE_PAUSE_ESCALATION_TICKS:-4} ticks/${MINE_PAUSE_MIN_SECONDS:-60}s/${MINE_PAUSE_MIN_RUN_SECONDS:-60}s)"
+    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-all}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default}, temp-target=${MINE_TEMP_TARGET:-$DEFAULT_T_TARGET}°C±${MINE_TEMP_DEADBAND:-$DEFAULT_TEMP_DEADBAND}, pause-escalation=${MINE_PAUSE_ESCALATION_TICKS:-4} ticks/${MINE_PAUSE_MIN_SECONDS:-60}s/${MINE_PAUSE_MIN_RUN_SECONDS:-60}s)"
 fi
 
 # Always every physical core unless a profile explicitly caps it — no
@@ -512,13 +538,54 @@ call_xmrig_rpc() {  # $1 = "pause" or "resume"
     [[ "$code" == "200" ]]
 }
 
+# Finds a k10temp/zenpower hwmon's $1 sensor ("Tdie" or "Tctl") and
+# echoes its temp*_input path, empty if none found. Split out of
+# fetch_cpu_temp so the Tdie-then-Tctl preference below is two calls, not
+# nested loop/break logic.
+_find_amd_temp_sensor() {
+    local hwmon label_file name
+    for hwmon in /sys/class/hwmon/hwmon*; do
+        name="$(cat "$hwmon/name" 2>/dev/null)"
+        [[ "$name" == "k10temp" || "$name" == "zenpower" ]] || continue
+        for label_file in "$hwmon"/temp*_label; do
+            [[ -r "$label_file" ]] || continue
+            if [[ "$(cat "$label_file" 2>/dev/null)" == "$1" ]]; then
+                echo "${label_file%_label}_input"
+                return
+            fi
+        done
+    done
+}
+
 fetch_cpu_temp() {
-    # /sys/class/thermal is the generic Linux thermal framework — works on
-    # x86 (ACPI) and ARM/RPi (SoC thermal zones) alike with zero extra
-    # dependencies, unlike lm_sensors' AMD-specific Tctl parsing. Zone
-    # numbering isn't guaranteed to mean the same thing across boards, so
-    # just take the hottest reading across all zones as a "how hot is this
-    # box running" proxy — good enough for a status bar.
+    # Prefer a direct CPU-die sensor (k10temp/zenpower) over the generic
+    # ACPI thermal_zone framework below when available — confirmed live
+    # on real hardware that thermal_zone's acpitz doesn't track real Tdie
+    # reliably: under a 150s sustained load test it read 6°C *under* the
+    # actual die temp (78.0°C reported vs. zenpower's 84.0°C), the
+    # dangerous direction for a thermal governor since it means
+    # capping/pause decisions lag behind a real temperature rise. The gap
+    # wasn't even a consistent offset across idle/light/heavy load
+    # samples — a genuinely different sensor with different thermal
+    # coupling, not something a fixed correction could fix. k10temp
+    # (mainline) and zenpower (the common out-of-tree alternative) share
+    # the same labeling convention: "Tdie" if the chip exposes it, else
+    # "Tctl".
+    local temp_file
+    temp_file="$(_find_amd_temp_sensor Tdie)"
+    [[ -z "$temp_file" ]] && temp_file="$(_find_amd_temp_sensor Tctl)"
+    if [[ -n "$temp_file" && -r "$temp_file" ]]; then
+        awk '{printf "%.1f", $1/1000}' "$temp_file"
+        return
+    fi
+
+    # Fallback: the generic Linux thermal framework — works on any board
+    # (ARM/RPi SoC thermal zones included) with zero extra dependencies,
+    # but only reached when no k10temp/zenpower hwmon exists (non-AMD
+    # hosts, most ARM boards) since it's the less-trustworthy source per
+    # the finding above. Zone numbering isn't guaranteed to mean the same
+    # thing across boards, so take the hottest reading across all zones
+    # as a "how hot is this box running" proxy.
     local hottest=""
     for f in /sys/class/thermal/thermal_zone*/temp; do
         [[ -r "$f" ]] || continue
@@ -582,9 +649,11 @@ launch_xmrig() {
     # governor's step is decoupled from the error size, which is what
     # produces that oscillation (repeated ΔT swings, worse for thermal-
     # cycling fatigue than settling at one point).
-    T_TARGET="${MINE_TEMP_TARGET:-80}"       # default: midpoint of the old 85°C cap / 75°C release band
-    TEMP_DEADBAND="${MINE_TEMP_DEADBAND:-2}" # default +/-2°C dead zone around target, absorbs sensor
-                                              # read noise instead of chasing every +/-0.5°C jitter
+    # DEFAULT_T_TARGET/DEFAULT_TEMP_DEADBAND: device-type-detected near
+    # the top of the script, inherited here from the parent shell.
+    T_TARGET="${MINE_TEMP_TARGET:-$DEFAULT_T_TARGET}"
+    TEMP_DEADBAND="${MINE_TEMP_DEADBAND:-$DEFAULT_TEMP_DEADBAND}" # absorbs sensor read noise
+                                                                    # instead of chasing every jitter
     # Max per-tick swing, same magnitude as the old fixed step (10% of the
     # hardware's freq range) — the proportional response is clamped to
     # this, so one bad reading can't slam frequency to an extreme in one

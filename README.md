@@ -74,9 +74,10 @@ generated from `config.json.example` on first run.
   those cores are generating the heat, so a host running fewer mining
   threads than physical cores doesn't needlessly cap the other cores'
   unrelated work) every 15s using proportional control (step size scales
-  with the temperature error, not a fixed-threshold trigger) targeting
-  80°C ±2°C — converges to a stable frequency in 1-2 ticks under sustained
-  load instead of oscillating off a hard cap threshold and back. Capping
+  with the temperature error, not a fixed-threshold trigger) targeting a
+  device-type-detected default (see the table below) — converges to a
+  stable frequency in 1-2 ticks under sustained load instead of
+  oscillating off a hard cap threshold and back. Capping
   (too hot) is twice as sensitive as releasing (cooler than target):
   overshooting down only costs a little throughput, overshooting up risks
   tripping the hardware's own PROCHOT before the next tick catches it.
@@ -112,19 +113,31 @@ MINE_THREADS=1          # cap CPU threads (default: unset = every physical core)
 MINE_RANDOMX_MODE=light # force fast/light (default: unset = auto from available RAM)
 MINE_HUGEPAGES=0         # override the huge-pages page count, 0 disables it (default: unset = auto)
 MINE_CPU_PRIORITY=1      # xmrig's own 0-5 internal thread priority (default: unset)
-MINE_TEMP_TARGET=70              # thermal governor's target °C (default: unset = 80)
-MINE_TEMP_DEADBAND=3             # +/-°C dead zone around the target (default: unset = 2)
+MINE_TEMP_TARGET=70              # thermal governor's target °C (default: unset = device-type-detected, see below)
+MINE_TEMP_DEADBAND=3             # +/-°C dead zone around the target (default: unset = device-type-detected)
 MINE_PAUSE_ESCALATION_TICKS=4    # governor ticks pinned at the freq floor before pausing (default: unset = 4, ~60s)
 MINE_PAUSE_MIN_SECONDS=60        # minimum time paused before resume is considered (default: unset = 60)
 MINE_PAUSE_MIN_RUN_SECONDS=60    # minimum time back at full hashing before pausing again (default: unset = 60)
 ```
 
-`MINE_TEMP_TARGET`/`MINE_TEMP_DEADBAND` matter most on hosts with weak or
-passive cooling (e.g. a Raspberry Pi) that never comfortably reach the
-80°C default — lowering the target makes the governor start capping
-clock speed earlier and settle at a lower steady-state frequency, trading
-some throughput for staying further from the hardware's real thermal
-limit.
+When `MINE_TEMP_TARGET`/`MINE_TEMP_DEADBAND` aren't set, `mine.sh` picks a
+default from the host's detected device class instead of one flat number
+— a conservative-for-sustained-operation internal-temp ceiling (CPU
+Tctl/Tdie/core, not heatsink or case surface) differs a lot by how a
+device is built to shed heat:
+
+| Device class | Detected via | Sustained-safe | Short-term peak | Avoid sustained |
+|---|---|---|---|---|
+| SBC (e.g. Raspberry Pi) | `uname -m` is `aarch64`/`arm*` | 40–70°C | 70–80°C | above 80°C |
+| Laptop | `/sys/class/power_supply/BAT*` exists | 50–85°C | 85–95°C | above 95°C, near 100°C |
+| Desktop | neither of the above | 35–75°C | 75–85°C | above 85–90°C |
+
+`mine.sh` targets the middle of each class's sustained-safe range: 65°C
+±3 (SBC), 80°C ±2 (laptop), 72°C ±2 (desktop). Override explicitly if the
+detected class is wrong for a given host, or to trade some throughput for
+running further from the limit — lowering the target makes the governor
+start capping clock speed earlier and settle at a lower steady-state
+frequency.
 
 The `MINE_PAUSE_*` knobs tune a second, last-resort escalation: on
 hardware where frequency capping alone can't reach equilibrium (passive
