@@ -28,15 +28,40 @@ if [[ -t 1 ]]; then
         printf '%s' "$1"
         printf '\0338'
     }
+fi
 
-    cleanup_bar() {
-        [[ -n "${STATUS_LOOP_PID:-}" ]] && kill "$STATUS_LOOP_PID" 2>/dev/null
-        [[ -n "${CONTROL_LOOP_PID:-}" ]] && kill "$CONTROL_LOOP_PID" 2>/dev/null
+# power-profiles-daemon manages the same amd-pstate EPP knob our own
+# thermal governor and gamemode below both try to control — confirmed
+# live this session: with it left on "power-saver", scaling_max_freq
+# writes had zero effect (cur_freq stuck at the hardware's absolute
+# floor regardless of load), and switching it to "balanced" changed
+# behavior immediately. Not something to fight from inside the control
+# loop's own writes — it's a separate daemon that will just reassert its
+# own preference on its own schedule. Switch it out of the way for the
+# life of this script instead, and put it back on exit rather than
+# permanently overriding a desktop-wide preference the user set for
+# reasons unrelated to mining. No sudo needed — profile switches go
+# through polkit for the active session user. A no-op (empty
+# PREV_POWER_PROFILE, restore skipped) on any host without the daemon.
+PREV_POWER_PROFILE="$(powerprofilesctl get 2>/dev/null)"
+if [[ -n "$PREV_POWER_PROFILE" ]]; then
+    if powerprofilesctl set performance 2>/dev/null; then
+        echo "⚡ power-profiles-daemon: ${PREV_POWER_PROFILE} -> performance (restored on exit)"
+    else
+        echo "⚠️  couldn't switch power-profiles-daemon to performance, continuing without" >&2
+    fi
+fi
+
+cleanup_bar() {
+    [[ -n "${STATUS_LOOP_PID:-}" ]] && kill "$STATUS_LOOP_PID" 2>/dev/null
+    [[ -n "${CONTROL_LOOP_PID:-}" ]] && kill "$CONTROL_LOOP_PID" 2>/dev/null
+    if [[ "$IS_TTY" == true ]]; then
         printf '\033[r'
         printf '\033[%d;1H\n' "$LINES_TOTAL"
-    }
-    trap cleanup_bar EXIT INT TERM
-fi
+    fi
+    [[ -n "$PREV_POWER_PROFILE" ]] && powerprofilesctl set "$PREV_POWER_PROFILE" 2>/dev/null
+}
+trap cleanup_bar EXIT INT TERM
 
 echo "🔍 Resolving xmrig binary path (nix develop)"
 XMRIG_STORE_BIN="$(nix develop --command bash -c 'readlink -f "$(which xmrig)"')"
@@ -271,13 +296,12 @@ MINE_CPU_PRIORITY=""
 MINE_TEMP_TARGET=""
 MINE_TEMP_DEADBAND=""
 MINE_PAUSE_ESCALATION_TICKS=""
-MINE_PAUSE_MIN_SECONDS=""
 MINE_PAUSE_MIN_RUN_SECONDS=""
 MINE_ALLOW_BATTERY_MINING=""
 if [[ -f mining-profile.local ]]; then
     # shellcheck disable=SC1091
     source mining-profile.local
-    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-all}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default}, temp-target=${MINE_TEMP_TARGET:-$DEFAULT_T_TARGET}°C±${MINE_TEMP_DEADBAND:-$DEFAULT_TEMP_DEADBAND}, pause-escalation=${MINE_PAUSE_ESCALATION_TICKS:-4} ticks/${MINE_PAUSE_MIN_SECONDS:-60}s/${MINE_PAUSE_MIN_RUN_SECONDS:-60}s, battery-mining=${MINE_ALLOW_BATTERY_MINING:-off})"
+    echo "⚙️  Loaded mining-profile.local (threads=${MINE_THREADS:-all}, randomx-mode=${MINE_RANDOMX_MODE:-auto}, huge-pages=${MINE_HUGEPAGES:-auto}, cpu-priority=${MINE_CPU_PRIORITY:-default}, temp-target=${MINE_TEMP_TARGET:-$DEFAULT_T_TARGET}°C±${MINE_TEMP_DEADBAND:-$DEFAULT_TEMP_DEADBAND}, pause-escalation=${MINE_PAUSE_ESCALATION_TICKS:-4} ticks/${MINE_PAUSE_MIN_RUN_SECONDS:-60}s, battery-mining=${MINE_ALLOW_BATTERY_MINING:-off})"
 fi
 
 # Force-corrected every run, like autosave/hw-aes above — a config.json
@@ -434,16 +458,23 @@ fi
 # knob (this box's amd-pstate-epp does); where it's missing, thermal
 # response just quietly has nothing to act on below.
 #
-# Scoped to MINING_CORE_LIST (the same pinned subset patch_thread_pin used
-# for "rx"), not a blanket cpu* glob — one shared thermal sensor drives the
-# governor's readings, but heat only comes from the cores actually mining,
-# so a host running MINE_THREADS below its physical core count (idle cores
-# doing other work) shouldn't have those other cores capped too.
-IFS=',' read -ra MINING_CORE_IDS <<<"$MINING_CORE_LIST"
-CPUFREQ_MAX_FILES=()
-for _core in "${MINING_CORE_IDS[@]}"; do
-    CPUFREQ_MAX_FILES+=("/sys/devices/system/cpu/cpu${_core}/cpufreq/scaling_max_freq")
-done
+# Blanket cpu* glob, not scoped to MINING_CORE_LIST — an earlier version
+# of this script scoped it to just the mining-pinned cores on the theory
+# that idle cores don't generate heat so don't need capping. Confirmed
+# live that's wrong: an idle SMT sibling with no mining thread on it
+# still shares the same chip's package-level boost/power arbitration, and
+# leaving it uncapped gives the firmware an escape valve to shift boost
+# budget there instead of respecting the cap on the core actually pinned
+# for mining. Verified directly — capping only the 8 mining-pinned cores
+# left 7 of them running ~200-600MHz above the requested cap under real
+# 8-thread RandomX load, regardless of governor/EPP; capping all 16
+# logical cores alongside them (still only 8 running mining threads),
+# every mining-pinned core tracked the cap tightly and temperature
+# actually dropped. So this isn't a tradeoff against MINE_THREADS running
+# below the physical core count — the unused cores need the same
+# treatment for the same reason regardless.
+CPUFREQ_MAX_FILES=(/sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq)
+CPUFREQ_CUR_FREQ_FILES=(/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq)
 if [[ -e "${CPUFREQ_MAX_FILES[0]}" ]]; then
     if [[ -w "${CPUFREQ_MAX_FILES[0]}" ]]; then
         echo "   ✅ cpufreq scaling_max_freq already writable, skipping"
@@ -475,12 +506,13 @@ if [[ -e "${CPUFREQ_GOVERNOR_FILES[0]}" ]]; then
     fi
 fi
 
-# Writes $1 (kHz) to each mining-pinned core's scaling_max_freq — this, not
-# thread-count reduction, is the thermal governor's actual lever: it caps
-# clock speed under all currently-running threads instead of stopping some
-# of them, so xmrig itself is never touched (no restart, no RandomX dataset
-# re-init, no gap in hashing) — just runs cooler and a bit slower until
-# temperature allows clocking back up.
+# Writes $1 (kHz) to every logical core's scaling_max_freq (mining-pinned
+# or idle, see above) — this, not thread-count reduction, is the thermal
+# governor's actual lever: it caps clock speed under all currently-
+# running threads instead of stopping some of them, so xmrig itself is
+# never touched (no restart, no RandomX dataset re-init, no gap in
+# hashing) — just runs cooler and a bit slower until temperature allows
+# clocking back up.
 set_cpu_max_freq() {
     local ok=true
     for f in "${CPUFREQ_MAX_FILES[@]}"; do
@@ -669,24 +701,28 @@ launch_xmrig() {
     echo "running" >"$PAUSE_STATE_FILE"
     PAUSE_STATE=running
     HOT_AT_FLOOR_TICKS=0
-    PAUSE_STARTED_AT=0
-    LAST_RESUME_AT=0
-    # Adaptive minimum pause duration — same problem the fixed-step
-    # frequency governor had before proportional control fixed it (a
-    # constant response decoupled from how well it's actually working),
-    # but pause/resume has no continuous dial to step, only on/off, so
-    # the fix here is a different shape: the *duration* backs off when a
-    # pause clearly wasn't enough (resumed, then reheated and needed to
-    # pause again almost immediately) and shrinks back down when cooling
-    # is clearly fast (satisfied the resume condition well before the
-    # minimum even elapsed) — so a host that's genuinely borderline
-    # converges to whatever duration actually works instead of retrying
-    # the same guess forever, and a host that cools quickly doesn't keep
-    # paying for a longer-than-needed minimum once it's proven unnecessary.
-    PAUSE_MIN_BASE="${MINE_PAUSE_MIN_SECONDS:-60}"
+    COOL_TICKS=0
+    LAST_RUN_AT=0
     PAUSE_MIN_RUN_BASE="${MINE_PAUSE_MIN_RUN_SECONDS:-60}"
-    PAUSE_MIN_SECONDS_CURRENT="$PAUSE_MIN_BASE"
-    PAUSE_TEMP_OK_AT=0
+    # Duty-cycling, not one long pause: instead of a single sustained
+    # pause (which meant every resume threw 100% load at a chip that had
+    # just been sitting at 0%, spiking temperature back up within
+    # seconds — exactly the oscillation problem proportional control
+    # fixed for frequency, just re-appearing here since pause/resume has
+    # no continuous dial, only on/off), escalation now alternates on/off
+    # every tick at a duty-cycle percentage that scales with how far over
+    # target the temperature is — same proportional philosophy as the
+    # frequency governor above, applied to time-averaged load instead of
+    # clock speed. DUTY_ON tracks which half of the current tick's
+    # decision xmrig is actually in; DUTY_CREDIT (0-99) is a Bresenham-
+    # style accumulator that spreads e.g. a 40% duty cycle as evenly as
+    # ON,OFF,OFF,ON,OFF... rather than bursty.
+    DUTY_ON=true
+    DUTY_CREDIT=0
+    DUTY_MAX=90 # even right at the trigger threshold, immediately give up
+    # some duty rather than staying at 100% for one more tick
+    DUTY_MIN=15 # never fully stop trying to make progress
+    DUTY_RANGE_C=10 # °C past target+deadband to go from DUTY_MAX to DUTY_MIN
 
     # Proportional control, not fixed-threshold bang-bang: step size scales
     # with how far off T_TARGET the reading is, so the loop converges to a
@@ -717,8 +753,36 @@ launch_xmrig() {
     # actual write fails, rather than retrying (and re-logging) every 15s
     # for the rest of the session once we know it won't work.
     CPUFREQ_WRITABLE=true
+    # Separately: the write succeeding doesn't mean the hardware actually
+    # honored it — a safety net for hardware where even the full-core
+    # capping above (see the comment by CPUFREQ_MAX_FILES) still doesn't
+    # stick, e.g. a firmware power policy that ignores the request
+    # outright. Same self-disable shape as CPUFREQ_WRITABLE above:
+    # verified false once, stays false for the rest of the session.
+    CPUFREQ_EFFECTIVE=true
+    PENDING_CAP_VERIFY_FREQ=""
     while kill -0 "$XMRIG_PID" 2>/dev/null; do
         TEMP="$(fetch_cpu_temp)"
+
+        # One tick after a capping write, check whether it actually landed
+        # on enough cores to matter — not just that the write itself
+        # didn't error. Under half of them tracking the requested cap
+        # (15% tolerance for read jitter/settle lag) counts as
+        # ineffective; the escalation path below then stops waiting for
+        # CURRENT_MAX_FREQ to crawl all the way to CPUFREQ_HW_MIN and
+        # lets duty-cycling take over immediately instead.
+        if [[ -n "$PENDING_CAP_VERIFY_FREQ" && "$CPUFREQ_EFFECTIVE" == true ]]; then
+            COMPLIANT_CORES=0
+            for _f in "${CPUFREQ_CUR_FREQ_FILES[@]}"; do
+                _cur="$(cat "$_f" 2>/dev/null || echo 0)"
+                awk -v c="$_cur" -v want="$PENDING_CAP_VERIFY_FREQ" 'BEGIN { exit !(c <= want * 1.15) }' && COMPLIANT_CORES=$((COMPLIANT_CORES + 1))
+            done
+            if [[ $((COMPLIANT_CORES * 2)) -lt "${#CPUFREQ_CUR_FREQ_FILES[@]}" ]]; then
+                CPUFREQ_EFFECTIVE=false
+                echo "⚠️  cpufreq cap only landed on ${COMPLIANT_CORES}/${#CPUFREQ_CUR_FREQ_FILES[@]} cores, treating frequency capping as ineffective for this session" >&2
+            fi
+        fi
+        PENDING_CAP_VERIFY_FREQ=""
 
         # Thermal governor: caps clock speed under whatever's currently
         # running instead of stopping threads — xmrig itself is never
@@ -752,6 +816,7 @@ launch_xmrig() {
                     [[ "$NEW_MAX_FREQ" -gt "$CURRENT_MAX_FREQ" ]] && DIRECTION="releasing"
                     echo "   🌡️  ${TEMP}°C (target ${T_TARGET}°C ±${TEMP_DEADBAND}), ${DIRECTION} max freq $((CURRENT_MAX_FREQ / 1000))MHz -> $((NEW_MAX_FREQ / 1000))MHz"
                     CURRENT_MAX_FREQ="$NEW_MAX_FREQ"
+                    [[ "$DIRECTION" == capping ]] && PENDING_CAP_VERIFY_FREQ="$NEW_MAX_FREQ"
                 else
                     echo "⚠️  cpufreq write failed (permission?), disabling thermal governor for this session" >&2
                     CPUFREQ_WRITABLE=false
@@ -779,7 +844,7 @@ launch_xmrig() {
         # within a payout window a miner was active — so this is purely
         # temperature-driven, no block-time-awareness needed.
         AT_FLOOR=false
-        if [[ "$CPUFREQ_HW_MAX" -eq 0 || "$CPUFREQ_WRITABLE" == false ]]; then
+        if [[ "$CPUFREQ_HW_MAX" -eq 0 || "$CPUFREQ_WRITABLE" == false || "$CPUFREQ_EFFECTIVE" == false ]]; then
             AT_FLOOR=true
         elif [[ "$CURRENT_MAX_FREQ" -eq "$CPUFREQ_HW_MIN" ]]; then
             AT_FLOOR=true
@@ -791,70 +856,87 @@ launch_xmrig() {
             else
                 HOT_AT_FLOOR_TICKS=0
             fi
-            if [[ "$HOT_AT_FLOOR_TICKS" -ge "${MINE_PAUSE_ESCALATION_TICKS:-4}" && $((NOW - LAST_RESUME_AT)) -ge "$PAUSE_MIN_RUN_BASE" ]]; then
-                if call_xmrig_rpc pause; then
-                    # Oscillation check: only meaningful from the second
-                    # pause onward (LAST_RESUME_AT is still 0 the very
-                    # first time). A run that barely cleared the
-                    # PAUSE_MIN_RUN_BASE gate before needing to pause
-                    # again means the last pause didn't buy enough
-                    # margin — back off by doubling, capped at 8x base so
-                    # a persistently bad host still converges somewhere
-                    # rather than growing without bound.
-                    if [[ "$LAST_RESUME_AT" -gt 0 && $((NOW - LAST_RESUME_AT)) -lt $((PAUSE_MIN_RUN_BASE * 2)) ]]; then
-                        PAUSE_MIN_SECONDS_CURRENT=$((PAUSE_MIN_SECONDS_CURRENT * 2))
-                        pause_cap=$((PAUSE_MIN_BASE * 8))
-                        [[ "$PAUSE_MIN_SECONDS_CURRENT" -gt "$pause_cap" ]] && PAUSE_MIN_SECONDS_CURRENT="$pause_cap"
-                        echo "   ⏫ only ran $((NOW - LAST_RESUME_AT))s before overheating again — extending minimum pause to ${PAUSE_MIN_SECONDS_CURRENT}s"
-                    fi
-                    PAUSE_STATE=cooling
-                    PAUSE_STARTED_AT="$NOW"
-                    PAUSE_TEMP_OK_AT=0
-                    echo "cooling ${NOW}" >"$PAUSE_STATE_FILE"
-                    echo "   ❄️  ${TEMP}°C, frequency capping alone isn't enough — pausing xmrig to cool down"
-                else
-                    echo "⚠️  temp still high at frequency floor, but pause RPC call failed — will retry" >&2
-                fi
+            if [[ "$HOT_AT_FLOOR_TICKS" -ge "${MINE_PAUSE_ESCALATION_TICKS:-4}" && $((NOW - LAST_RUN_AT)) -ge "$PAUSE_MIN_RUN_BASE" ]]; then
+                PAUSE_STATE=duty_cycling
+                DUTY_CREDIT=0
+                COOL_TICKS=0
+                DUTY_ON=true # already at 100% load this tick; the duty
+                # calc below decides the *next* tick, not a forced pause
+                # on the very tick escalation triggers
+                echo "   🔥 ${TEMP}°C, frequency capping alone isn't enough — switching to duty-cycled pause/resume to control average load"
             fi
         else
-            # Track the first tick temp actually satisfies the resume
-            # condition, independent of whether the minimum-duration gate
-            # below has elapsed yet — this is what lets a fast-cooling
-            # host be recognized as such even while still waiting out the
-            # minimum, instead of only ever seeing "resumed at exactly
-            # the minimum" and never learning the minimum is more than
-            # it needs.
-            if [[ "$PAUSE_TEMP_OK_AT" -eq 0 && -n "$TEMP" ]] && awk -v t="$TEMP" -v target="$T_TARGET" -v db="$TEMP_DEADBAND" 'BEGIN { exit !(t < target - db) }'; then
-                PAUSE_TEMP_OK_AT="$NOW"
+            # Duty-cycling: recompute the target on-fraction every tick
+            # from the live temperature error (same proportional shape as
+            # the frequency governor above — bigger excess, lower duty),
+            # then use a Bresenham-style accumulator (DUTY_CREDIT, 0-99)
+            # to decide *this* tick's on/off, so e.g. 40% duty spreads as
+            # ON,OFF,OFF,ON,OFF... rather than one long burst followed by
+            # one long gap — which was the whole problem with a single
+            # sustained pause: every resume threw 100% load at a chip
+            # that had just been sitting at 0%, spiking temperature back
+            # up within seconds.
+            if [[ -n "$TEMP" ]]; then
+                DUTY_PCT="$(awk -v t="$TEMP" -v target="$T_TARGET" -v db="$TEMP_DEADBAND" \
+                    -v dmax="$DUTY_MAX" -v dmin="$DUTY_MIN" -v range="$DUTY_RANGE_C" 'BEGIN {
+                    excess = t - target - db
+                    if (excess < 0) excess = 0
+                    d = dmax - (dmax - dmin) * excess / range
+                    if (d < dmin) d = dmin
+                    if (d > dmax) d = dmax
+                    printf "%d", d
+                }')"
+            else
+                DUTY_PCT="$DUTY_MIN" # no reading — stay conservative, not optimistic
+            fi
+            DUTY_CREDIT=$((DUTY_CREDIT + DUTY_PCT))
+            WANT_ON=false
+            if [[ "$DUTY_CREDIT" -ge 100 ]]; then
+                DUTY_CREDIT=$((DUTY_CREDIT - 100))
+                WANT_ON=true
             fi
             # RPC failures here just retry next tick (unlike the freq
             # governor's permanent self-disable above) — a network blip
             # calling this last-resort safety net isn't the same class of
             # failure as a permission grant that's presumably permanent,
             # and self-disabling would defeat the whole point of it.
-            if [[ -n "$TEMP" ]] && awk -v t="$TEMP" -v target="$T_TARGET" -v db="$TEMP_DEADBAND" 'BEGIN { exit !(t < target - db) }' && [[ $((NOW - PAUSE_STARTED_AT)) -ge "$PAUSE_MIN_SECONDS_CURRENT" ]]; then
+            if [[ "$WANT_ON" == true && "$DUTY_ON" == false ]]; then
                 if call_xmrig_rpc resume; then
-                    # Shrink check: if it satisfied the resume condition
-                    # in well under half the current minimum, that
-                    # minimum is more conservative than this cooldown
-                    # actually needed — ease back toward the configured
-                    # base rather than paying the inflated duration
-                    # forever once it's proven unnecessary.
-                    if [[ "$PAUSE_TEMP_OK_AT" -gt 0 ]]; then
-                        cool_time=$((PAUSE_TEMP_OK_AT - PAUSE_STARTED_AT))
-                        if [[ "$cool_time" -lt $((PAUSE_MIN_SECONDS_CURRENT / 2)) ]]; then
-                            PAUSE_MIN_SECONDS_CURRENT=$((PAUSE_MIN_SECONDS_CURRENT / 2))
-                            [[ "$PAUSE_MIN_SECONDS_CURRENT" -lt "$PAUSE_MIN_BASE" ]] && PAUSE_MIN_SECONDS_CURRENT="$PAUSE_MIN_BASE"
-                            echo "   ⏬ cooled in ${cool_time}s, well under the minimum — shrinking to ${PAUSE_MIN_SECONDS_CURRENT}s"
-                        fi
-                    fi
+                    DUTY_ON=true
+                    echo "duty_cycling ${NOW} ${DUTY_PCT} on" >"$PAUSE_STATE_FILE"
+                    echo "   🔁 ${TEMP:-N/A}°C, duty-cycling at ${DUTY_PCT}% — resuming this tick"
+                else
+                    echo "⚠️  duty cycle wanted to resume but RPC call failed — will retry" >&2
+                fi
+            elif [[ "$WANT_ON" == false && "$DUTY_ON" == true ]]; then
+                if call_xmrig_rpc pause; then
+                    DUTY_ON=false
+                    echo "duty_cycling ${NOW} ${DUTY_PCT} off" >"$PAUSE_STATE_FILE"
+                    echo "   🔁 ${TEMP:-N/A}°C, duty-cycling at ${DUTY_PCT}% — pausing this tick"
+                else
+                    echo "⚠️  duty cycle wanted to pause but RPC call failed — will retry" >&2
+                fi
+            fi
+
+            # Exit once comfortably under target for a sustained stretch
+            # — same debounce length as the trigger, so entering and
+            # leaving are symmetric rather than one being twitchier than
+            # the other.
+            if [[ -n "$TEMP" ]] && awk -v t="$TEMP" -v target="$T_TARGET" -v db="$TEMP_DEADBAND" 'BEGIN { exit !(t < target - db) }'; then
+                COOL_TICKS=$((COOL_TICKS + 1))
+            else
+                COOL_TICKS=0
+            fi
+            if [[ "$COOL_TICKS" -ge "${MINE_PAUSE_ESCALATION_TICKS:-4}" ]]; then
+                if [[ "$DUTY_ON" == true ]] || call_xmrig_rpc resume; then
                     PAUSE_STATE=running
-                    LAST_RESUME_AT="$NOW"
+                    DUTY_ON=true
+                    LAST_RUN_AT="$NOW"
                     HOT_AT_FLOOR_TICKS=0
                     echo "running" >"$PAUSE_STATE_FILE"
-                    echo "   ✅ ${TEMP}°C, cooled down — resuming"
+                    echo "   ✅ ${TEMP}°C, cooled down — back to full-time running"
                 else
-                    echo "⚠️  cooled down but resume RPC call failed — will retry" >&2
+                    echo "⚠️  cooled down but resume RPC call failed on duty-cycling exit — will retry" >&2
                 fi
             fi
         fi
@@ -925,9 +1007,10 @@ if [[ "$IS_TTY" == true ]]; then
             # timestamp the generic API field doesn't.
             HASHRATE_PART="⚡ ${HASHRATE:-N/A} H/s"
             PAUSE_STATUS="$(cat "$BINARY_DIR/pause-state" 2>/dev/null)"
-            if [[ "$PAUSE_STATUS" == cooling* ]]; then
-                COOLING_SINCE="${PAUSE_STATUS#cooling }"
-                HASHRATE_PART="❄️  cooling down ($(($(date +%s) - COOLING_SINCE))s)"
+            if [[ "$PAUSE_STATUS" == duty_cycling* ]]; then
+                # "duty_cycling <epoch> <pct> <on|off>"
+                read -r _ DUTY_SINCE DUTY_STATUS_PCT DUTY_STATUS_ONOFF <<<"$PAUSE_STATUS"
+                HASHRATE_PART="🔁 duty-cycling ${DUTY_STATUS_PCT}% ($(($(date +%s) - DUTY_SINCE))s, ${DUTY_STATUS_ONOFF})"
             elif [[ "$(fetch_xmrig_paused)" == "true" ]]; then
                 HASHRATE_PART="🔌 paused (on battery?)"
             fi
