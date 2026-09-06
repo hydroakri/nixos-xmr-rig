@@ -143,6 +143,18 @@ if [[ ! -d "$BINARY_DIR" ]] || [[ "$(stat -c %U "$BINARY_DIR" 2>/dev/null)" != "
 fi
 XMRIG_BIN="$BINARY_DIR/xmrig"
 NEED_SETCAP=false
+
+# Separate from BINARY_DIR on purpose: the pause/duty-cycle state file
+# written below is rewritten every 10-20s while duty-cycling and never
+# needs to survive a reboot (it only exists so the status-bar subshell
+# can read what the control-loop subshell is doing right now) — on a
+# host where BINARY_DIR sits on real persistent storage instead of a
+# tmpfs root (unlike this project's own dev box), that write pattern
+# adds up to thousands of small writes a day for zero benefit. /dev/shm
+# is tmpfs everywhere, so this is free real-storage-write avoidance
+# regardless of the host's actual root filesystem.
+RUNTIME_DIR="/dev/shm/xmr-mining-$(id -u)"
+mkdir -p "$RUNTIME_DIR"
 if ! cmp -s "$XMRIG_STORE_BIN" "$XMRIG_BIN" 2>/dev/null; then
     cp -f "$XMRIG_STORE_BIN" "$XMRIG_BIN"
     chmod +x "$XMRIG_BIN"
@@ -697,7 +709,7 @@ launch_xmrig() {
     # Reset unconditionally on every launch (not left to the TTY-only
     # cleanup_bar trap) so a fresh run never inherits "cooling" from a
     # prior killed session.
-    PAUSE_STATE_FILE="$BINARY_DIR/pause-state"
+    PAUSE_STATE_FILE="$RUNTIME_DIR/pause-state"
     echo "running" >"$PAUSE_STATE_FILE"
     PAUSE_STATE=running
     HOT_AT_FLOOR_TICKS=0
@@ -1006,7 +1018,7 @@ if [[ "$IS_TTY" == true ]]; then
             # pause-state file first since it also carries a "since when"
             # timestamp the generic API field doesn't.
             HASHRATE_PART="⚡ ${HASHRATE:-N/A} H/s"
-            PAUSE_STATUS="$(cat "$BINARY_DIR/pause-state" 2>/dev/null)"
+            PAUSE_STATUS="$(cat "$RUNTIME_DIR/pause-state" 2>/dev/null)"
             if [[ "$PAUSE_STATUS" == duty_cycling* ]]; then
                 # "duty_cycling <epoch> <pct> <on|off>"
                 read -r _ DUTY_SINCE DUTY_STATUS_PCT DUTY_STATUS_ONOFF <<<"$PAUSE_STATUS"
