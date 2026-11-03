@@ -25,7 +25,8 @@ generated from `config.json.example` on first run.
 ## What `mine.sh` does
 
 - Resolves `xmrig` from the nix store, copies it to `/var/lib/xmr-mining`
-- Injects the wallet address from `wallet-address.local` into `config.json`
+- Injects `wallet-address.local` + the hostname (letters/digits only) into
+  `config.json` as the `WALLET/WORKER` login
 - Resolves the pool IP via Quad9 unfiltered DoH (`9.9.9.10`), writes it
   into `config.json`
 - Uses every physical core by default (override with `MINE_THREADS` in
@@ -72,7 +73,7 @@ generated from `config.json.example` on first run.
 - Runs `xmrig -c config.json`
 - On a real terminal, reserves the last row as a live status bar via ANSI
   scroll-region control codes — no tmux dependency: CPU temp + hashrate
-  (local, refreshed every 10s) and pool pending/paid/shares/ETA-to-payout
+  (local, refreshed every 10s) and pool pending/paid/threshold-progress/ETA-to-payout
   (network, refreshed every 5 min, falling back to local Tor SOCKS on
   `127.0.0.1:9050` if present and direct access is blocked). Piped/non-TTY
   runs get a single one-line pending/paid print instead of the bar.
@@ -200,7 +201,14 @@ against real hardware yet.
     every launch, so only `"enabled"` needs setting.
 - `mine.sh` roots the dev shell at `.nix-shell-profile` (gitignored) on every
   launch so `nix-collect-garbage` keeps it.
-- Defaults to SupportXMR over TLS, remote-node setup — no local `monerod`.
+- Defaults to Kryptex (`xmr.kryptex.network:8029`, TLS), remote-node setup —
+  no local `monerod`.
+- Kryptex payout: PPS+, 1% pool fee, no payout fee, hourly. Threshold
+  0.01–1.0 XMR, default 0.1. Set it at `pool.kryptex.com/xmr` → paste address
+  → Settings (the form asks for the worker's IP). Pending balance stays on
+  the pool it was earned on.
+- Stats come from `xmr-api.kryptex.network`; `pool.kryptex.com` bans clients
+  that request unknown paths.
 - Never touches wallet private keys, seed phrases, or view keys.
 - `"autosave": false` in `config.json.example` — xmrig would otherwise
   write back per-host thread arrays on exit, baking one machine's core

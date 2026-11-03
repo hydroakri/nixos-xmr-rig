@@ -182,9 +182,12 @@ echo "💰 Injecting wallet address from wallet-address.local (kept out of git �
 WALLET_ADDRESS_FILE="wallet-address.local"
 if [[ -f "$WALLET_ADDRESS_FILE" ]]; then
     WALLET_ADDRESS="$(tr -d '[:space:]' <"$WALLET_ADDRESS_FILE")"
-    sed -i -E "s/\"user\": *\"[^\"]*\"/\"user\": \"${WALLET_ADDRESS}\"/" config.json
+    # Kryptex wants WALLET/WORKER as the login; worker names are Latin
+    # letters/digits only, so strip anything else out of the hostname.
+    WORKER_NAME="$(hostname | tr -cd 'A-Za-z0-9')"
+    sed -i -E "s|\"user\": *\"[^\"]*\"|\"user\": \"${WALLET_ADDRESS}/${WORKER_NAME:-rig}\"|" config.json
     echo "   ✅ wallet address injected"
-    echo "   📊 dashboard: https://www.supportxmr.com/#/dashboard?wallet=${WALLET_ADDRESS}"
+    echo "   📊 dashboard: https://pool.kryptex.com/xmr (paste your address; Settings sets the payout threshold)"
 else
     echo "❌ $WALLET_ADDRESS_FILE not found — put your Monero address in it (one line, nothing else)" >&2
     exit 1
@@ -205,8 +208,8 @@ resolve_via_doh() {
 }
 
 echo "🌐 Resolving pool IP via Quad9 unfiltered DoH (bypasses local sing-box blocklist + Quad9's own default-node filtering)"
-POOL_DOMAIN="pool.supportxmr.com"
-POOL_PORT="443"
+POOL_DOMAIN="xmr.kryptex.network"
+POOL_PORT="8029"
 RESOLVED_IP="$(resolve_via_doh "$POOL_DOMAIN")"
 if [[ -n "$RESOLVED_IP" ]]; then
     sed -i -E "s/\"url\": *\"[^\"]*:${POOL_PORT}\"/\"url\": \"${RESOLVED_IP}:${POOL_PORT}\"/" config.json
@@ -215,19 +218,14 @@ else
     echo "⚠️  Quad9 unfiltered DoH lookup failed, keeping the IP already in config.json" >&2
 fi
 
-# The status bar's pending/paid stats come from supportxmr.com's own web
-# API — a different domain than the stratum pool above, blocked by the
-# same blocklist chain, but never routed around because that fetch
-# (further down) still went through system DNS. Resolve it here too and
-# hand the IP to curl via --resolve, which overrides only the DNS step —
-# TLS SNI and cert validation still happen against the real hostname, so
-# this doesn't need xmrig's sni:false workaround (confirmed live: TLS
-# handshake completes fine once DNS is out of the way, so SNI inspection
-# isn't in play here). Use www.supportxmr.com directly rather than the
-# bare domain — the bare domain 301-redirects to www, and curl -sL (used
-# below) would follow that to a *second* hostname our --resolve override
-# doesn't cover, right back to a blocked system-DNS lookup.
-STATS_DOMAIN="www.supportxmr.com"
+# The status bar's pending/paid stats come from Kryptex's miner API — a
+# different domain than the stratum pool above, and resolved here the same
+# way: hand the IP to curl via --resolve, which overrides only the DNS step
+# — TLS SNI and cert validation still happen against the real hostname, so
+# this doesn't need xmrig's sni:false workaround. xmr-api.kryptex.network
+# is the host the API's own pagination links point at; the documented
+# base, pool.kryptex.com, bans clients that request unknown paths.
+STATS_DOMAIN="xmr-api.kryptex.network"
 STATS_DOMAIN_IP="$(resolve_via_doh "$STATS_DOMAIN")"
 if [[ -n "$STATS_DOMAIN_IP" ]]; then
     echo "   ✅ stats API IP resolved to ${STATS_DOMAIN_IP} (${STATS_DOMAIN})"
@@ -569,25 +567,35 @@ fi
 # the pool url); if that's blocked, retry via local Tor SOCKS only if
 # already present on this machine (no hard Tor dependency — a machine
 # without it just gets the warning). Tor gets no --resolve: its own exit
-# node does DNS, already unaffected by any local blocking. Echoes the
-# pool's raw JSON, empty on total failure. Shared by the live status bar
-# loop below and the non-interactive one-shot fallback.
-fetch_pool_stats_json() {
-    local stats="" resolve_arg=()
+# node does DNS, already unaffected by any local blocking. Echoes the raw
+# JSON of one /api/v1/ path, empty on total failure.
+fetch_pool_api() { # $1 = path under /api/v1/
+    local body="" resolve_arg=()
     [[ -n "$STATS_DOMAIN_IP" ]] && resolve_arg=(--resolve "${STATS_DOMAIN}:443:${STATS_DOMAIN_IP}")
-    if [[ -n "${WALLET_ADDRESS:-}" ]]; then
-        stats="$(curl -sL "${resolve_arg[@]}" --max-time 6 "https://${STATS_DOMAIN}/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
-        if [[ -z "$stats" ]] && timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9050' 2>/dev/null; then
-            stats="$(curl -sL --socks5-hostname 127.0.0.1:9050 --max-time 30 "https://${STATS_DOMAIN}/api/miner/${WALLET_ADDRESS}/stats" 2>/dev/null)"
-        fi
+    body="$(curl -sL "${resolve_arg[@]}" --max-time 6 "https://${STATS_DOMAIN}/api/v1/$1" 2>/dev/null)"
+    if [[ -z "$body" ]] && timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/9050' 2>/dev/null; then
+        body="$(curl -sL --socks5-hostname 127.0.0.1:9050 --max-time 30 "https://${STATS_DOMAIN}/api/v1/$1" 2>/dev/null)"
     fi
-    echo "$stats" | grep -q '"amtDue"' && echo "$stats"
+    echo "$body"
 }
 
-# Shared by both the live status bar loop and the non-interactive fallback
-# below, instead of each re-deriving the same three fields independently.
+# Balance (total/threshold/reached_pct, in XMR) and payout stats (paid) are
+# two endpoints; echoed as one blob so parse_pool_field can read either.
+# Empty on failure. Shared by the live status bar loop below and the
+# non-interactive one-shot fallback.
+fetch_pool_stats_json() {
+    local balance paid
+    [[ -n "${WALLET_ADDRESS:-}" ]] || return 1
+    balance="$(fetch_pool_api "miner/balance/${WALLET_ADDRESS}")"
+    echo "$balance" | grep -q '"total"' || return 1
+    paid="$(fetch_pool_api "miner/payouts/${WALLET_ADDRESS}/stats")"
+    echo "$balance $paid"
+}
+
+# Kryptex reports decimal XMR (e.g. 0.0012, possibly exponent form), not
+# the integer piconero other pools use.
 parse_pool_field() {
-    echo "$1" | grep -o "\"$2\":[0-9]*" | grep -o '[0-9]*'
+    echo "$1" | grep -oE "\"$2\": *-?[0-9.]+([eE][-+]?[0-9]+)?" | grep -oE -- '-?[0-9.]+([eE][-+]?[0-9]+)?$' | head -1
 }
 
 # Local, cheap, safe to poll every few seconds — xmrig's own loopback API.
@@ -985,9 +993,9 @@ if [[ "$IS_TTY" == true ]]; then
     (
         # Hashrate + temp are local and cheap — refreshed every tick (10s).
         # Pool data needs a network round-trip and shouldn't be hammered —
-        # refreshed every 30th tick (~5 min). ETA to the 0.1 XMR payout
-        # threshold comes from the delta between consecutive pool readings,
-        # no extra requests needed for it.
+        # refreshed every 30th tick (~5 min). ETA to the payout threshold
+        # comes from the delta between consecutive pool readings; the
+        # threshold arrives in the same balance response.
         POOL_PART="fetching pool data..."
         PREV_DUE=""
         PREV_TIME=""
@@ -999,15 +1007,16 @@ if [[ "$IS_TTY" == true ]]; then
             if ((TICK % 30 == 0)); then
                 STATS_JSON="$(fetch_pool_stats_json)"
                 if [[ -n "$STATS_JSON" ]]; then
-                    DUE="$(parse_pool_field "$STATS_JSON" amtDue)"
-                    PAID="$(parse_pool_field "$STATS_JSON" amtPaid)"
-                    SHARES="$(parse_pool_field "$STATS_JSON" validShares)"
+                    DUE="$(parse_pool_field "$STATS_JSON" total)"
+                    PAID="$(parse_pool_field "$STATS_JSON" paid)"
+                    REACHED="$(parse_pool_field "$STATS_JSON" reached_pct)"
+                    TARGET="$(parse_pool_field "$STATS_JSON" threshold)"
                     NOW=$(date +%s)
                     ETA_TEXT="calculating..."
-                    if [[ -n "$PREV_DUE" && "$DUE" -gt "$PREV_DUE" ]]; then
-                        ETA_TEXT="$(awk -v due="$DUE" -v prev="$PREV_DUE" -v now="$NOW" -v prevt="$PREV_TIME" 'BEGIN {
+                    if [[ -n "$PREV_DUE" ]]; then
+                        ETA_TEXT="$(awk -v due="${DUE:-0}" -v prev="$PREV_DUE" -v now="$NOW" -v prevt="$PREV_TIME" -v target="${TARGET:-0}" 'BEGIN {
+                            if (due <= prev) { print "calculating..."; exit }
                             rate = (due - prev) / (now - prevt)
-                            target = 100000000000
                             remain = target - due
                             if (rate <= 0 || remain <= 0) { print "n/a"; exit }
                             secs = remain / rate
@@ -1019,10 +1028,10 @@ if [[ "$IS_TTY" == true ]]; then
                             else printf "%dm", m
                         }')"
                     fi
-                    PREV_DUE="$DUE"
+                    PREV_DUE="${DUE:-0}"
                     PREV_TIME="$NOW"
-                    POOL_PART="$(awk -v due="${DUE:-0}" -v paid="${PAID:-0}" -v shares="${SHARES:-0}" -v eta="$ETA_TEXT" 'BEGIN {
-                        printf "Pending: %.8f | Paid: %.8f | Shares: %s | ETA: %s", due/1e12, paid/1e12, shares, eta
+                    POOL_PART="$(awk -v due="${DUE:-0}" -v paid="${PAID:-0}" -v reached="${REACHED:-0}" -v eta="$ETA_TEXT" 'BEGIN {
+                        printf "Pending: %.8f | Paid: %.8f | Threshold: %.0f%% | ETA: %s", due, paid, reached, eta
                     }')"
                 else
                     POOL_PART="⚠️  pool unreachable (direct blocked, no local Tor)"
@@ -1058,11 +1067,11 @@ if [[ "$IS_TTY" == true ]]; then
 else
     STATS_JSON="$(fetch_pool_stats_json)"
     if [[ -n "$STATS_JSON" ]]; then
-        DUE="$(parse_pool_field "$STATS_JSON" amtDue)"
-        PAID="$(parse_pool_field "$STATS_JSON" amtPaid)"
-        SHARES="$(parse_pool_field "$STATS_JSON" validShares)"
-        awk -v due="${DUE:-0}" -v paid="${PAID:-0}" -v shares="${SHARES:-0}" 'BEGIN {
-            printf "📊 XMR Pending: %.8f | XMR Paid: %.8f | Valid shares: %s\n", due/1e12, paid/1e12, shares
+        DUE="$(parse_pool_field "$STATS_JSON" total)"
+        PAID="$(parse_pool_field "$STATS_JSON" paid)"
+        REACHED="$(parse_pool_field "$STATS_JSON" reached_pct)"
+        awk -v due="${DUE:-0}" -v paid="${PAID:-0}" -v reached="${REACHED:-0}" 'BEGIN {
+            printf "📊 XMR Pending: %.8f | XMR Paid: %.8f | Threshold reached: %.0f%%\n", due, paid, reached
         }'
     else
         echo "⚠️  couldn't reach the pool's API (direct blocked, no local Tor)" >&2

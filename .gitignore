@@ -15,3 +15,4 @@ mining-profile.local
 # GC root for the dev shell, managed by mine.sh (nix develop --profile);
 # keeps xmrig/xmrig-cuda from being collected by nix-collect-garbage.
 .nix-shell-profile*
+/.cache

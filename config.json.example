@@ -54,8 +54,8 @@
         {
             "algo": null,
             "coin": null,
-            "url": "pool.supportxmr.com:443",
-            "user": "YOUR_WALLET_ADDRESS_HERE",
+            "url": "xmr.kryptex.network:8029",
+            "user": "YOUR_WALLET_ADDRESS_HERE/YOUR_HOSTNAME_HERE",
             "pass": "x",
             "rig-id": "YOUR_HOSTNAME_HERE",
             "nicehash": false,
