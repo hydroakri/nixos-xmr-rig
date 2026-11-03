@@ -187,8 +187,19 @@ against real hardware yet.
 
 ## Notes
 
-- CPU-only. GPU mining RandomX is slower and less power-efficient than CPU
-  — `opencl`/`cuda` stay disabled.
+- CPU-only by default. GPU mining RandomX is slower and less power-efficient
+  than CPU — `opencl`/`cuda` stay disabled.
+- The dev shell builds xmrig with the OpenCL backend (`WITH_OPENCL`) and
+  ships `xmrig-cuda` and `clinfo`. Only one GPU backend should be enabled
+  per card. Check with `xmrig --opencl --print-platforms`.
+  - CUDA: `"cuda": {"enabled": true, "loader": "<store path>/lib/libxmrig-cuda.so"}`
+  - OpenCL: `"opencl": {"enabled": true, "platform": "NVIDIA",
+    "loader": "/run/opengl-driver/lib/libOpenCL.so.1"}`
+  - `loader` is required in both: `mine.sh` setcaps the binary, which makes
+    the kernel drop `LD_LIBRARY_PATH`. `mine.sh` rewrites `cuda.loader` on
+    every launch, so only `"enabled"` needs setting.
+- `mine.sh` roots the dev shell at `.nix-shell-profile` (gitignored) on every
+  launch so `nix-collect-garbage` keeps it.
 - Defaults to SupportXMR over TLS, remote-node setup — no local `monerod`.
 - Never touches wallet private keys, seed phrases, or view keys.
 - `"autosave": false` in `config.json.example` — xmrig would otherwise

@@ -64,12 +64,21 @@ cleanup_bar() {
 trap cleanup_bar EXIT INT TERM
 
 echo "🔍 Resolving xmrig binary path (nix develop)"
-XMRIG_STORE_BIN="$(nix develop --command bash -c 'readlink -f "$(which xmrig)"')"
+# --profile registers the dev shell as a GC root (.nix-shell-profile, gitignored,
+# project-local) so nix-collect-garbage can't drop xmrig/xmrig-cuda and force a
+# multi-minute rebuild. Re-run on every launch: a no-op when the flake is
+# unchanged, repoints the root to a new generation after a flake update.
+XMRIG_STORE_BIN="$(nix develop --profile .nix-shell-profile --command bash -c 'readlink -f "$(which xmrig)"')"
 if [[ -z "$XMRIG_STORE_BIN" ]]; then
     echo "❌ Failed to resolve xmrig path" >&2
     exit 1
 fi
 echo "   $XMRIG_STORE_BIN"
+
+# xmrig-cuda is only in the dev shell on x86_64 (see flake.nix); empty
+# elsewhere, in which case the cuda loader below is left untouched.
+CUDA_PLUGIN="$(nix develop --command bash -c 'for p in $nativeBuildInputs; do [[ $p == *-xmrig-cuda-* ]] && echo "$p/lib/libxmrig-cuda.so"; done')"
+[[ -n "$CUDA_PLUGIN" ]] && echo "   $CUDA_PLUGIN"
 
 echo "🔍 Resolving gamemoded binary path (nix develop)"
 GAMEMODED_STORE_BIN="$(nix develop --command bash -c 'readlink -f "$(which gamemoded)" 2>/dev/null')"
@@ -261,6 +270,20 @@ in_http && /^[[:space:]]*\},?[[:space:]]*$/ { in_http=0 }
 # was set to false in config.json.example may still have it on. "autosave"
 # is a unique top-level key, safe for a plain sed (no block-scoping needed).
 sed -i -E 's/"autosave": *true/"autosave": false/' config.json
+
+# Re-pointed every run: the xmrig-cuda store path changes on every flake
+# update, and setcap (below) makes the kernel drop LD_LIBRARY_PATH, so xmrig
+# can't find the plugin by name — it needs the absolute path. "loader" also
+# appears under "opencl", hence the block-scoped awk. "enabled" is left to
+# the user; the path only matters once cuda is switched on.
+if [[ -n "$CUDA_PLUGIN" ]]; then
+    awk -v loader="$CUDA_PLUGIN" '
+/"cuda": *\{/ { in_cuda=1 }
+in_cuda && /"loader":/ { sub(/: *(null|"[^"]*")/, ": \"" loader "\"") }
+in_cuda && /^[[:space:]]*\},?[[:space:]]*$/ { in_cuda=0 }
+{ print }
+' config.json >config.json.tmp && mv config.json.tmp config.json
+fi
 
 # Force-corrected every run for the same reason: a config.json generated
 # before this existed may still have "hw-aes": true baked in from an
